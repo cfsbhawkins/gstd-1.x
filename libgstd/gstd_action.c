@@ -208,7 +208,7 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   GstdAction *action = NULL;
   GSignalQuery query;
   guint action_id;
-  gint ret_sig = 0;
+  GValue ret_sig = G_VALUE_INIT;
   GValue *args = NULL;
   gchar **arg_list = NULL;
 
@@ -224,25 +224,19 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
       G_OBJECT_TYPE (action->target));
   g_signal_query (action_id, &query);
 
-  GST_ERROR_OBJECT (action, "description: %s", description);
-
-  // You must parse description into arg_list[] matching query.n_params
   arg_list = g_strsplit (description, " ", query.n_params + 1);
   if (!arg_list) {
-    GST_ERROR_OBJECT (action, "!arg_list");
     return GSTD_BAD_VALUE;
   }
 
-  args = g_new0 (GValue, query.n_params + 2);
+  /* One additional value to store the instance as first value */
+  args = g_new0 (GValue, query.n_params + 1);
 
   g_value_init (&args[0], G_TYPE_OBJECT);
   g_value_set_object (&args[0], action->target);
 
   for (guint i = 1; i <= query.n_params; i++) {
-    g_value_init (&args[i], query.param_types[i]);
-
-    GST_ERROR_OBJECT (action, "param_type: %s",
-        g_type_name (query.param_types[0]));
+    g_value_init (&args[i], query.param_types[i - 1]);
 
     if (query.param_types[i - 1] == G_TYPE_STRING) {
       g_value_set_string (&args[i], arg_list[i]);
@@ -253,8 +247,6 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     } else if (query.param_types[i - 1] == G_TYPE_UINT64) {
       g_value_set_uint64 (&args[i], (guint64) g_ascii_strtoull (arg_list[i],
               NULL, 10));
-      GST_ERROR_OBJECT (action, "arg_list[i+1]: %s", arg_list[i]);
-      GST_ERROR_OBJECT (action, "value: %ld", g_value_get_uint64 (&args[i]));
     } else if (query.param_types[i - 1] == G_TYPE_BOOLEAN) {
       g_value_set_boolean (&args[i], g_strcmp0 (arg_list[i], "true") == 0);
     } else if (query.param_types[i - 1] == G_TYPE_FLOAT) {
@@ -267,22 +259,16 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     }
   }
 
-  // Set return value container as G_TYPE_INT, stored in ret_sig
-  g_value_init (&args[query.n_params], G_TYPE_INT);
+  if (query.return_type != G_TYPE_NONE) {
+    g_value_init(&ret_sig, query.return_type);
+    g_signal_emitv (args, action_id, 0, &ret_sig);
 
-  GST_ERROR_OBJECT (action, "Emit to %s", GST_OBJECT_NAME (action->target));
-  GST_ERROR_OBJECT (action, "description: %s", description);
-  GST_ERROR_OBJECT (action, "name: %s", name);
-  GST_ERROR_OBJECT (action, "n_params: %d", query.n_params);
-  GST_ERROR_OBJECT (action, "object name(action): %s",
-      GSTD_OBJECT_NAME (action));
+    /* TODO: Use ret_sig value */
 
-  g_signal_emitv (args, action_id, 0, &args[query.n_params]);
-
-  ret_sig = g_value_get_int (&args[query.n_params]);
-
-  if (ret_sig != 0)
-    ret = GSTD_BAD_VALUE;
+    g_value_unset(&ret_sig);
+  } else {
+    g_signal_emitv (args, action_id, 0, NULL);
+  }
 
 out:
   for (guint i = 0; i <= query.n_params; i++)
