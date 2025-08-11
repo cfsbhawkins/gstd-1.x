@@ -36,10 +36,16 @@ GST_DEBUG_CATEGORY_STATIC (gstd_http_debug);
 
 #define GSTD_DEBUG_DEFAULT_LEVEL GST_LEVEL_INFO
 
+#if SOUP_CHECK_VERSION(3,0,0)
+typedef SoupServerMessage SoupMsg;
+#else
+typedef SoupMessage SoupMsg;
+#endif
+
 typedef struct _GstdHttpRequest
 {
   SoupServer *server;
-  SoupServerMessage *msg;
+  SoupMsg *msg;
   GstdSession *session;
   const char *path;
   GHashTable *query;
@@ -73,17 +79,17 @@ static GstdReturnCode gstd_http_stop (GstdIpc * base);
 static gboolean gstd_http_init_get_option_group (GstdIpc * base,
     GOptionGroup ** group);
 static SoupStatus get_status_code (GstdReturnCode ret);
-static GstdReturnCode do_get (SoupServer * server, SoupServerMessage * msg,
+static GstdReturnCode do_get (SoupServer * server, SoupMsg * msg,
     char **output, const char *path, GstdSession * session);
-static GstdReturnCode do_post (SoupServer * server, SoupServerMessage * msg,
+static GstdReturnCode do_post (SoupServer * server, SoupMsg * msg,
     char *name, char *description, char **output, const char *path,
     GstdSession * session);
-static GstdReturnCode do_put (SoupServer * server, SoupServerMessage * msg,
+static GstdReturnCode do_put (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
-static GstdReturnCode do_delete (SoupServer * server, SoupServerMessage * msg,
+static GstdReturnCode do_delete (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
 static void do_request (gpointer data_request, gpointer eval);
-static void server_callback (SoupServer * server, SoupServerMessage * msg,
+static void server_callback (SoupServer * server, SoupMsg * msg,
     const char *path, GHashTable * query, gpointer data);
 
 static void
@@ -167,7 +173,7 @@ get_status_code (GstdReturnCode ret)
 }
 
 static GstdReturnCode
-do_get (SoupServer * server, SoupServerMessage * msg, char **output, const char *path,
+do_get (SoupServer * server, SoupMsg * msg, char **output, const char *path,
     GstdSession * session)
 {
   gchar *message = NULL;
@@ -188,7 +194,7 @@ do_get (SoupServer * server, SoupServerMessage * msg, char **output, const char 
 }
 
 static GstdReturnCode
-do_post (SoupServer * server, SoupServerMessage * msg, char *name,
+do_post (SoupServer * server, SoupMsg * msg, char *name,
     char *description, char **output, const char *path, GstdSession * session)
 {
   gchar *message = NULL;
@@ -223,7 +229,7 @@ out:
 }
 
 static GstdReturnCode
-do_put (SoupServer * server, SoupServerMessage * msg, char *name, char **output,
+do_put (SoupServer * server, SoupMsg * msg, char *name, char **output,
     const char *path, GstdSession * session)
 {
   gchar *message = NULL;
@@ -253,7 +259,7 @@ out:
 }
 
 static GstdReturnCode
-do_delete (SoupServer * server, SoupServerMessage * msg, char *name,
+do_delete (SoupServer * server, SoupMsg * msg, char *name,
     char **output, const char *path, GstdSession * session)
 {
   gchar *message = NULL;
@@ -293,7 +299,7 @@ do_request (gpointer data_request, gpointer eval)
   const gchar *description = NULL;
   SoupStatus status = SOUP_STATUS_OK;
   SoupServer *server = NULL;
-  SoupServerMessage *msg = NULL;
+  SoupMsg *msg = NULL;
   GstdSession *session = NULL;
   const char *path = NULL;
   GHashTable *query = NULL;
@@ -315,8 +321,11 @@ do_request (gpointer data_request, gpointer eval)
     name = g_hash_table_lookup (query, "name");
     description_pipe = g_hash_table_lookup (query, "description");
   }
-
+#if SOUP_CHECK_VERSION(3,0,0)
   method = soup_server_message_get_method (msg);
+#else
+  method = msg->method;
+#endif
   if (method == SOUP_METHOD_GET) {
     ret = do_get (server, msg, &output, path, session);
   } else if (method == SOUP_METHOD_POST) {
@@ -337,15 +346,30 @@ do_request (gpointer data_request, gpointer eval)
   g_free (output);
   output = NULL;
 
+#if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
       response, strlen (response));
+#else
+  soup_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
+      response, strlen (response));
+#endif
   g_free (response);
   response = NULL;
 
   status = get_status_code (ret);
+#if SOUP_CHECK_VERSION(3,2,0)
   soup_server_message_set_status (msg, status, NULL);
   g_mutex_lock (data_request_local->mutex);
   soup_server_message_unpause (msg);
+#elif SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_status (msg, status, NULL);
+  g_mutex_lock (data_request_local->mutex);
+  soup_server_unpause_message (server, msg);
+#else
+  soup_message_set_status (msg, status);
+  g_mutex_lock (data_request_local->mutex);
+  soup_server_unpause_message (server, msg);
+#endif
   g_mutex_unlock (data_request_local->mutex);
 
   if (query != NULL) {
@@ -358,9 +382,8 @@ do_request (gpointer data_request, gpointer eval)
 }
 
 static void
-server_callback (SoupServer * server, SoupServerMessage * msg,
-    const char *path, GHashTable * query,
-    gpointer data)
+server_callback (SoupServer * server, SoupMsg * msg,
+    const char *path, GHashTable * query, gpointer data)
 {
   GstdSession *session = NULL;
   GstdHttp *self = NULL;
@@ -387,7 +410,12 @@ server_callback (SoupServer * server, SoupServerMessage * msg,
   }
   data_request->mutex = &self->mutex;
 
+
+#if SOUP_CHECK_VERSION(3,0,0)
   response_headers = soup_server_message_get_request_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Origin", "*");
   soup_message_headers_append (response_headers,
@@ -395,7 +423,11 @@ server_callback (SoupServer * server, SoupServerMessage * msg,
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Methods", "PUT, GET, POST, DELETE");
   g_mutex_lock (&self->mutex);
+#if SOUP_CHECK_VERSION(3,2,0)
   soup_server_message_pause (msg);
+#else
+  soup_server_pause_message (server, msg);
+#endif
   g_mutex_unlock (&self->mutex);
   if (!g_thread_pool_push (self->pool, (gpointer) data_request, NULL)) {
     GST_ERROR_OBJECT (self->pool, "Thread pool push failed");
