@@ -224,7 +224,7 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
       G_OBJECT_TYPE (action->target));
   g_signal_query (action_id, &query);
 
-  arg_list = g_strsplit (description, " ", query.n_params + 1);
+  arg_list = g_strsplit (description, " ", query.n_params);
   if (!arg_list) {
     return GSTD_BAD_VALUE;
   }
@@ -235,24 +235,24 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   g_value_init (&args[0], G_TYPE_OBJECT);
   g_value_set_object (&args[0], action->target);
 
-  for (guint i = 1; i <= query.n_params; i++) {
-    g_value_init (&args[i], query.param_types[i - 1]);
+  for (guint i = 0; i < query.n_params; i++) {
+    g_value_init (&args[i + 1], query.param_types[i]);
 
-    if (query.param_types[i - 1] == G_TYPE_STRING) {
-      g_value_set_string (&args[i], arg_list[i]);
-    } else if (query.param_types[i - 1] == G_TYPE_INT) {
-      g_value_set_int (&args[i], atoi (arg_list[i]));
-    } else if (query.param_types[i - 1] == G_TYPE_UINT) {
-      g_value_set_uint (&args[i], (guint) atoi (arg_list[i]));
-    } else if (query.param_types[i - 1] == G_TYPE_UINT64) {
-      g_value_set_uint64 (&args[i], (guint64) g_ascii_strtoull (arg_list[i],
+    if (query.param_types[i] == G_TYPE_STRING) {
+      g_value_set_string (&args[i + 1], arg_list[i]);
+    } else if (query.param_types[i] == G_TYPE_INT) {
+      g_value_set_int (&args[i + 1], atoi (arg_list[i]));
+    } else if (query.param_types[i] == G_TYPE_UINT) {
+      g_value_set_uint (&args[i + 1], (guint) atoi (arg_list[i]));
+    } else if (query.param_types[i] == G_TYPE_UINT64) {
+      g_value_set_uint64 (&args[i + 1], (guint64) g_ascii_strtoull (arg_list[i],
               NULL, 10));
-    } else if (query.param_types[i - 1] == G_TYPE_BOOLEAN) {
-      g_value_set_boolean (&args[i], g_strcmp0 (arg_list[i], "true") == 0);
-    } else if (query.param_types[i - 1] == G_TYPE_FLOAT) {
-      g_value_set_float (&args[i], g_ascii_strtod (arg_list[i], NULL));
-    } else if (query.param_types[i - 1] == G_TYPE_DOUBLE) {
-      g_value_set_double (&args[i], g_ascii_strtod (arg_list[i], NULL));
+    } else if (query.param_types[i] == G_TYPE_BOOLEAN) {
+      g_value_set_boolean (&args[i + 1], g_strcmp0 (arg_list[i], "true") == 0);
+    } else if (query.param_types[i] == G_TYPE_FLOAT) {
+      g_value_set_float (&args[i + 1], g_ascii_strtod (arg_list[i], NULL));
+    } else if (query.param_types[i] == G_TYPE_DOUBLE) {
+      g_value_set_double (&args[i + 1], g_ascii_strtod (arg_list[i], NULL));
     } else {
       ret = GSTD_BAD_VALUE;
       goto out;
