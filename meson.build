@@ -29,9 +29,10 @@ jansson_dep   = dependency('jansson',            version : '>=2.7')
 thread_dep    = dependency('threads')
 libedit_dep   = dependency('libedit',            version : '>=3.0')
 
-libsoup_dep   = dependency('libsoup-3.0', version : '>=2.99', required: false)
+libsoup_dep   = dependency('libsoup-3.0', version : '>=3.0', required: false)
 if not libsoup_dep.found()
   libsoup_dep   = dependency('libsoup-2.4',        version : '>=2.4')
+  warning('libsoup-2.4 detected; this will be deprecated in upcoming releases. Please migrate to libsoup-3.0.')
 endif
 
 gst_check_required = get_option('enable-tests').enabled()
