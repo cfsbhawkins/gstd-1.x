@@ -91,19 +91,22 @@ PKG_CHECK_MODULES(GST, [
 
 PKG_CHECK_MODULES([LIBSOUP], [libsoup-3.0 >= 3.0], [
   AC_DEFINE([HAVE_LIBSOUP3], [1], [Define if libsoup3 exists.])
-], [
-  PKG_CHECK_MODULES([LIBSOUP], [libsoup-2.4 >= 2.4], [
-    AC_DEFINE([HAVE_LIBSOUP2], [1], [Define if libsoup2 exists.])
   ], [
-    AC_MSG_ERROR([
-      Can't find the following LIBSOUP development packages:
+  PKG_CHECK_MODULES([LIBSOUP], [libsoup-2.4 >= 2.4], [
+    AC_MSG_WARN(libsoup-2.4 detected: this library will be deprecated in upcoming releases.
+      Consider migrating to libsoup-3.0.)
+    ], [
+      AC_DEFINE([HAVE_LIBSOUP2], [1], [Define if libsoup2 exists.])
+      ], [
+      AC_MSG_ERROR([
+        Can't find any of the following LIBSOUP development packages:
 
-      libsoup-3.0              >= $LIBSOUP3_REQUIRED
-      libsoup-2.4              >= $LIBSOUP2_REQUIRED
+        libsoup-3.0              >= $LIBSOUP3_REQUIRED
+        libsoup-2.4              >= $LIBSOUP2_REQUIRED (to be deprecated in incoming releases)
 
-    Please make sure you have the necessary LIBSOUP3 or LIBSOUP2
-    development headers installed.
-    ])
+      Please make sure you have the necessary LIBSOUP3 or LIBSOUP2
+      development headers installed.
+      ])
   ])
 ])
 
