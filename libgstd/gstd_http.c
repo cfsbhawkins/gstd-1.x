@@ -357,20 +357,20 @@ do_request (gpointer data_request, gpointer eval)
   response = NULL;
 
   status = get_status_code (ret);
-#if SOUP_CHECK_VERSION(3,2,0)
+
+#if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_status (msg, status, NULL);
-  g_mutex_lock (data_request_local->mutex);
-  soup_server_message_unpause (msg);
-#elif SOUP_CHECK_VERSION(3,0,0)
-  soup_server_message_set_status (msg, status, NULL);
-  g_mutex_lock (data_request_local->mutex);
-  soup_server_unpause_message (server, msg);
 #else
   soup_message_set_status (msg, status);
+#endif
+
   g_mutex_lock (data_request_local->mutex);
+
+#if SOUP_CHECK_VERSION(3,2,0)
+  soup_server_message_unpause (msg);
+#else
   soup_server_unpause_message (server, msg);
 #endif
-  g_mutex_unlock (data_request_local->mutex);
 
   if (query != NULL) {
     g_hash_table_unref (query);
