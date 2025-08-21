@@ -224,10 +224,11 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
       G_OBJECT_TYPE (action->target));
   g_signal_query (action_id, &query);
 
-  arg_list = g_strsplit (description, " ", query.n_params);
-  if (!arg_list) {
+  if (query.n_params > 0 && g_strcmp0(description, "(null)") == 0) {
     return GSTD_BAD_VALUE;
   }
+
+  arg_list = g_strsplit (description, " ", query.n_params);
 
   /* One additional value to store the instance as first value */
   args = g_new0 (GValue, query.n_params + 1);
