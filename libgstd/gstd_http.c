@@ -371,6 +371,7 @@ do_request (gpointer data_request, gpointer eval)
 #else
   soup_server_unpause_message (server, msg);
 #endif
+  g_mutex_unlock (data_request_local->mutex);
 
   if (query != NULL) {
     g_hash_table_unref (query);
