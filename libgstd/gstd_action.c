@@ -224,11 +224,11 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
       G_OBJECT_TYPE (action->target));
   g_signal_query (action_id, &query);
 
-  if (query.n_params > 0 && g_strcmp0(description, "(null)") == 0) {
-    return GSTD_BAD_VALUE;
+  if (query.n_params > 0 && (!description || g_strcmp0(description, "(null)") == 0 || g_strcmp0(description, "") == 0)) {
+    return GSTD_NULL_ARGUMENT;
+  } else if (description) {
+    arg_list = g_strsplit (description, " ", query.n_params);
   }
-
-  arg_list = g_strsplit (description, " ", query.n_params);
 
   /* One additional value to store the instance as first value */
   args = g_new0 (GValue, query.n_params + 1);
@@ -255,7 +255,7 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     } else if (query.param_types[i] == G_TYPE_DOUBLE) {
       g_value_set_double (&args[i + 1], g_ascii_strtod (arg_list[i], NULL));
     } else {
-      ret = GSTD_BAD_VALUE;
+      ret = GSTD_BAD_COMMAND;
       goto out;
     }
   }
