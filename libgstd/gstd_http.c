@@ -176,8 +176,6 @@ do_get (SoupServer * server, SoupMessage * msg, char **output, const char *path,
   gchar *message = NULL;
   GstdReturnCode ret = GSTD_EOK;
 
-  GST_ERROR_OBJECT (session, "path value %s", path);
-
   g_return_val_if_fail (server, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (msg, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (session, GSTD_NULL_ARGUMENT);
@@ -198,9 +196,6 @@ do_post (SoupServer * server, SoupMessage * msg, char *name,
 {
   gchar *message = NULL;
   GstdReturnCode ret = GSTD_EOK;
-
-  GST_ERROR_OBJECT (session, "path value on post %s", path);
-  GST_ERROR_OBJECT (session, "name value on post %s", name);
 
   g_return_val_if_fail (server, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (msg, GSTD_NULL_ARGUMENT);
@@ -240,7 +235,6 @@ do_put (SoupServer * server, SoupMessage * msg, char *name, char **output,
   g_return_val_if_fail (server, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (msg, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (session, GSTD_NULL_ARGUMENT);
-  GST_ERROR_OBJECT (session, "name value %s", name);
   g_return_val_if_fail (name, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (output, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (path, GSTD_NULL_ARGUMENT);
