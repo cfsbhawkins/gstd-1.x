@@ -249,7 +249,7 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
       g_value_set_uint64 (&args[i + 1], (guint64) g_ascii_strtoull (arg_list[i],
               NULL, 10));
     } else if (query.param_types[i] == G_TYPE_BOOLEAN) {
-      g_value_set_boolean (&args[i + 1], g_strcmp0 (arg_list[i], "true") == 0);
+      g_value_set_boolean (&args[i + 1], g_ascii_strcasecmp (arg_list[i], "true") == 0);
     } else if (query.param_types[i] == G_TYPE_FLOAT) {
       g_value_set_float (&args[i + 1], g_ascii_strtod (arg_list[i], NULL));
     } else if (query.param_types[i] == G_TYPE_DOUBLE) {
@@ -264,7 +264,7 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     g_value_init(&ret_sig, query.return_type);
     g_signal_emitv (args, action_id, 0, &ret_sig);
 
-    /* TODO: Use ret_sig value */
+    /* The return value is not required */
 
     g_value_unset(&ret_sig);
   } else {
