@@ -365,21 +365,23 @@ do_request (gpointer data_request, gpointer eval)
 static void
 parse_json_body (SoupMessage *msg, gchar **out_name, gchar **out_desc)
 {
+  const char *content_type = NULL;
+  JsonParser *parser = NULL;
+  JsonNode *root = NULL;
+  GError *err = NULL;
+
   *out_name = NULL;
   *out_desc = NULL;
 
-  /* Materialize body */
   soup_message_body_flatten (msg->request_body);
   if (!msg->request_body || msg->request_body->length == 0)
     return;
 
-  /* Content-Type guard (optional) */
-  const char *ct = soup_message_headers_get_content_type (msg->request_headers, NULL);
-  if (!ct || !g_str_has_prefix (ct, "application/json"))
+  content_type = soup_message_headers_get_content_type (msg->request_headers, NULL);
+  if (!content_type || !g_str_has_prefix (content_type, "application/json"))
     return;
 
-  JsonParser *parser = json_parser_new ();
-  GError *err = NULL;
+  parser = json_parser_new ();
   if (!json_parser_load_from_data (parser,
                                    msg->request_body->data,
                                    msg->request_body->length,
@@ -389,16 +391,16 @@ parse_json_body (SoupMessage *msg, gchar **out_name, gchar **out_desc)
     return;
   }
 
-  JsonNode *root = json_parser_get_root (parser);
+  root = json_parser_get_root (parser);
   if (JSON_NODE_HOLDS_OBJECT (root)) {
-    JsonObject *o = json_node_get_object (root);
-    if (json_object_has_member (o, "name")) {
-      const char *v = json_object_get_string_member (o, "name");
-      if (v) *out_name = g_strdup (v);
+    JsonObject *obj = json_node_get_object (root);
+    if (json_object_has_member (obj, "name")) {
+      const char *value = json_object_get_string_member (obj, "name");
+      if (value) *out_name = g_strdup (value);
     }
-    if (json_object_has_member (o, "description")) {
-      const char *v = json_object_get_string_member (o, "description");
-      if (v) *out_desc = g_strdup (v);
+    if (json_object_has_member (obj, "description")) {
+      const char *value = json_object_get_string_member (obj, "description");
+      if (value) *out_desc = g_strdup (value);
     }
   }
   g_object_unref (parser);
