@@ -20,7 +20,8 @@ jobs:
           - os: ubuntu-22.04
             remove-unwind: fix-unwind
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
 
     steps:
     - uses: actions/checkout@v2
@@ -59,7 +60,8 @@ jobs:
           - os: ubuntu-22.04
             remove-unwind: fix-unwind
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
 
     steps:
     - uses: actions/checkout@v2
