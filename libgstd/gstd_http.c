@@ -403,30 +403,30 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   GError *err = NULL;
   const char *body_data = NULL;
   gsize body_length = 0;
+  SoupMessageBody *request_body = NULL;
+  SoupMessageHeaders *request_headers = NULL;
 
   *out_name = NULL;
   *out_desc = NULL;
 
 #if SOUP_CHECK_VERSION(3,0,0)
-  GBytes *request_body_bytes = soup_server_message_get_request_body (msg);
-  if (!request_body_bytes)
-    return;
-  
-  body_data = g_bytes_get_data (request_body_bytes, &body_length);
-  if (body_length == 0)
-    return;
-
-  SoupMessageHeaders *request_headers = soup_server_message_get_request_headers (msg);
-  content_type = soup_message_headers_get_content_type (request_headers, NULL);
+  request_body = soup_server_message_get_request_body (msg);
+  request_headers = soup_server_message_get_request_headers (msg);
 #else
-  soup_message_body_flatten (msg->request_body);
-  if (!msg->request_body || msg->request_body->length == 0)
+  request_body = msg->request_body;
+  request_headers = msg->request_headers;
+#endif
+
+  if (!request_body)
     return;
 
-  body_data = msg->request_body->data;
-  body_length = msg->request_body->length;
-  content_type = soup_message_headers_get_content_type (msg->request_headers, NULL);
-#endif
+  soup_message_body_flatten (request_body);
+  if (request_body->length == 0)
+    return;
+
+  body_data = request_body->data;
+  body_length = request_body->length;
+  content_type = soup_message_headers_get_content_type (request_headers, NULL);
 
   if (!content_type || !g_str_has_prefix (content_type, "application/json"))
     return;
