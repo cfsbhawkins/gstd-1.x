@@ -14,19 +14,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-20.04
-        include:
-          - os: ubuntu-22.04
-            remove-unwind: fix-unwind
+        ubuntu_version: [ "20.04", "22.04", "24.04" ]
 
-    runs-on: ubuntu-latest
-    container: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.ubuntu_version }}
 
     steps:
     - uses: actions/checkout@v2
-    - if: ${{ matrix.remove-unwind }}
-      run: sudo apt remove libunwind-14-dev
     - name: Dependecies
       run: |
         sudo apt update
@@ -54,19 +49,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-20.04
-        include:
-          - os: ubuntu-22.04
-            remove-unwind: fix-unwind
+        ubuntu_version: [ "20.04", "22.04", "24.04" ]
 
-    runs-on: ubuntu-latest
-    container: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.ubuntu_version }}
 
     steps:
     - uses: actions/checkout@v2
-    - if: ${{ matrix.remove-unwind }}
-      run: sudo apt remove libunwind-14-dev
     - name: Dependecies
       run: |
         sudo apt update
