@@ -24,10 +24,10 @@ jobs:
     - uses: actions/checkout@v2
     - name: Dependecies
       run: |
-        sudo apt update
-        sudo apt install automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-        sudo apt install libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-        sudo apt install libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+        apt update
+        apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+        apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
+        apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
     - name: Generate
       run: ./autogen.sh
     - name: Configure
@@ -37,7 +37,7 @@ jobs:
     - name: Checks
       run: make check
     - name: Install
-      run: sudo make install
+      run: make install
     - name: Check pygstc installation
       run: python3 -c "import pygstc"
     - name: List Pipelines Verification
@@ -59,12 +59,12 @@ jobs:
     - uses: actions/checkout@v2
     - name: Dependecies
       run: |
-        sudo apt update
-        sudo apt install automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-        sudo apt install libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-        sudo apt install libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
-        sudo apt install ninja-build python3-wheel
-        sudo pip3 install meson
+        apt update
+        apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+        apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
+        apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+        apt install -y ninja-build python3-wheel
+        pip3 install meson
 
     - name: Generate for Ubuntu 20.04 and above
       run: meson --werror build -Dpython.install_env=auto
@@ -73,7 +73,7 @@ jobs:
     - name: Checks
       run: ninja -C build test
     - name: Install
-      run: sudo ninja -C build install
+      run: ninja -C build install
     - name: Check pygstc installation
       run: python3 -c "import pygstc"
     - name: List Pipelines Verification
