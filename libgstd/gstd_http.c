@@ -349,6 +349,10 @@ do_request (gpointer data_request, gpointer eval)
   } else if (method == SOUP_METHOD_OPTIONS) {
     ret = GSTD_EOK;
   }
+  g_free (name);
+  g_free (description_pipe);
+  name = NULL;
+  description_pipe = NULL;
 
   description = gstd_return_code_to_string (ret);
   response =
