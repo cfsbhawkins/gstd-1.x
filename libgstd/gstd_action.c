@@ -230,6 +230,10 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     arg_list = g_strsplit (description, " ", query.n_params);
   }
 
+  if (g_strv_length (arg_list) != query.n_params) {
+    return GSTD_NULL_ARGUMENT;
+  }
+
   /* One additional value to store the instance as first value */
   args = g_new0 (GValue, query.n_params + 1);
 
