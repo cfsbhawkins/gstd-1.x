@@ -425,19 +425,22 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   request_headers = msg->request_headers;
 #endif
 
-  if (!request_body)
+  if (!request_body) {
     return;
+  }
 
   soup_message_body_flatten (request_body);
-  if (request_body->length == 0)
+  if (request_body->length == 0) {
     return;
+  }
 
   body_data = request_body->data;
   body_length = request_body->length;
   content_type = soup_message_headers_get_content_type (request_headers, NULL);
 
-  if (!content_type || !g_str_has_prefix (content_type, "application/json"))
+  if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
     return;
+  }
 
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
