@@ -242,9 +242,9 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
     if (query.param_types[i] == G_TYPE_STRING) {
       g_value_set_string (&args[i + 1], arg_list[i]);
     } else if (query.param_types[i] == G_TYPE_INT) {
-      g_value_set_int (&args[i + 1], atoi (arg_list[i]));
+      g_value_set_int (&args[i + 1], g_ascii_strtoll (arg_list[i], NULL, 10));
     } else if (query.param_types[i] == G_TYPE_UINT) {
-      g_value_set_uint (&args[i + 1], (guint) atoi (arg_list[i]));
+      g_value_set_uint (&args[i + 1], (guint) g_ascii_strtoull (arg_list[i], NULL, 10));
     } else if (query.param_types[i] == G_TYPE_UINT64) {
       g_value_set_uint64 (&args[i + 1], (guint64) g_ascii_strtoull (arg_list[i],
               NULL, 10));
