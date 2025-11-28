@@ -410,6 +410,10 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   SoupMessageBody *request_body = NULL;
   SoupMessageHeaders *request_headers = NULL;
 
+  g_return_if_fail (msg);
+  g_return_if_fail (out_name);
+  g_return_if_fail (out_desc);
+
   *out_name = NULL;
   *out_desc = NULL;
 
