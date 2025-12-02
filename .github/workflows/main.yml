@@ -15,6 +15,9 @@
         fail-fast: false
         matrix:
           ubuntu_version: [ "20.04", "22.04", "24.04" ]
+          include:
+            - ubuntu_version: "20.04"
+              libsoup2: "libsoup2.4-dev"
 
       runs-on: ubuntu-24.04
       container:
@@ -28,7 +31,12 @@
           apt update
           apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
           apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools
+          if [ "${{ matrix.libsoup2 }}" ]; then
+            apt install -y libsoup2.4-dev
+          else
+            apt install -y libsoup-3.0-dev
+          fi
       - name: Generate
         run: ./autogen.sh
       - name: Configure
@@ -54,6 +62,8 @@
             include:
             - ubuntu_version: "24.04"
               meson_opts: "-Dpython.install_env=auto"
+            - ubuntu_version: "20.04"
+              libsoup2: "libsoup2.4-dev"
 
       runs-on: ubuntu-24.04
       container:
@@ -67,7 +77,12 @@
           apt update
           apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
           apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools
+          if [ "${{ matrix.libsoup2 }}" ]; then
+            apt install -y libsoup2.4-dev
+          else
+            apt install -y libsoup-3.0-dev
+          fi
           apt install -y ninja-build meson
 
       - name: Generate for Ubuntu 20.04 and above
