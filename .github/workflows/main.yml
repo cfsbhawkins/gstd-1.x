@@ -1,82 +1,84 @@
-name: gstd CI
+  name: gstd CI
 
-on:
-  push:
-    branches:
-      - master
-      - develop
-  pull_request:
-    branches:
-      - develop
+  on:
+    push:
+      branches:
+        - master
+        - develop
+    pull_request:
+      branches:
+        - develop
 
-jobs:
-  autotools:
-    strategy:
-      fail-fast: false
-      matrix:
-        ubuntu_version: [ "20.04", "22.04", "24.04" ]
+  jobs:
+    autotools:
+      strategy:
+        fail-fast: false
+        matrix:
+          ubuntu_version: [ "20.04", "22.04", "24.04" ]
 
-    runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:${{ matrix.ubuntu_version }}
+      runs-on: ubuntu-24.04
+      container:
+        image: ubuntu:${{ matrix.ubuntu_version }}
 
-    steps:
-    - uses: actions/checkout@v2
-    - name: Dependecies
-      run: |
-        apt update
-        apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-        apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-        apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
-    - name: Generate
-      run: ./autogen.sh
-    - name: Configure
-      run: ./configure CFLAGS=-Werror
-    - name: Compile
-      run: make
-    - name: Checks
-      run: make check
-    - name: Install
-      run: make install
-    - name: Check pygstc installation
-      run: python3 -c "import pygstc"
-    - name: List Pipelines Verification
-      run: |
-        gstd -e
-        gstd-client list_pipelines
+      steps:
+      - uses: actions/checkout@v2
+      - name: Dependecies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt update
+          apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
+          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+      - name: Generate
+        run: ./autogen.sh
+      - name: Configure
+        run: ./configure CFLAGS=-Werror
+      - name: Compile
+        run: make
+      - name: Checks
+        run: make check
+      - name: Install
+        run: make install
+      - name: Check pygstc installation
+        run: python3 -c "import pygstc"
+      - name: List Pipelines Verification
+        run: |
+          gstd -e
+          gstd-client list_pipelines
 
-  meson:
-    strategy:
-      fail-fast: false
-      matrix:
-        ubuntu_version: [ "20.04", "22.04", "24.04" ]
+    meson:
+      strategy:
+        fail-fast: false
+        matrix:
+          ubuntu_version: [ "20.04", "22.04", "24.04" ]
 
-    runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:${{ matrix.ubuntu_version }}
+      runs-on: ubuntu-24.04
+      container:
+        image: ubuntu:${{ matrix.ubuntu_version }}
 
-    steps:
-    - uses: actions/checkout@v2
-    - name: Dependecies
-      run: |
-        apt update
-        apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-        apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
-        apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
-        apt install -y ninja-build python3-wheel
-        pip3 install meson
+      steps:
+      - uses: actions/checkout@v2
+      - name: Dependecies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt update
+          apt install -y automake libtool pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          apt install -y libglib2.0-dev libjson-glib-dev gtk-doc-tools libedit-dev libncursesw5-dev
+          apt install -y libdaemon-dev libjansson-dev python3-pip python3-setuptools libsoup-3.0-dev
+          apt install -y ninja-build python3-wheel
+          pip3 install meson
 
-    - name: Generate for Ubuntu 20.04 and above
-      run: meson --werror build -Dpython.install_env=auto
-    - name: Compile
-      run: ninja -C build
-    - name: Checks
-      run: ninja -C build test
-    - name: Install
-      run: ninja -C build install
-    - name: Check pygstc installation
-      run: python3 -c "import pygstc"
-    - name: List Pipelines Verification
-      run: |
-        gstd -e
-        gstd-client list_pipelines
+      - name: Generate for Ubuntu 20.04 and above
+        run: meson --werror build -Dpython.install_env=auto
+      - name: Compile
+        run: ninja -C build
+      - name: Checks
+        run: ninja -C build test
+      - name: Install
+        run: ninja -C build install
+      - name: Check pygstc installation
+        run: python3 -c "import pygstc"
+      - name: List Pipelines Verification
+        run: |
+          gstd -e
+          gstd-client list_pipelines
