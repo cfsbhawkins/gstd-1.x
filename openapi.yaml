@@ -1,0 +1,1173 @@
+openapi: 3.0.3
+info:
+  title: GStreamer Daemon API
+  description: |
+    REST API for controlling GStreamer pipelines remotely via GStreamer Daemon (gstd).
+
+    This API allows you to create, read, update, and delete GStreamer pipelines and their
+    properties over HTTP. All responses follow a consistent JSON envelope format.
+
+    For additional documentation, see the official RidgeRun wiki:
+    https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
+  version: 0.15.2
+  license:
+    name: LGPL-2.0
+    url: https://www.gnu.org/licenses/lgpl-2.0.html
+  contact:
+    name: RidgeRun
+    url: https://www.ridgerun.com
+
+servers:
+  - url: http://localhost:5001
+    description: Default gstd HTTP server
+
+tags:
+  - name: Health
+    description: Health check endpoints for container orchestration (fork-specific)
+  - name: Pipelines
+    description: Pipeline lifecycle management
+  - name: State
+    description: Pipeline state control
+  - name: Elements
+    description: Pipeline element access
+  - name: Properties
+    description: Element property management
+  - name: Bus
+    description: Pipeline bus message handling
+  - name: Signals
+    description: Element signal management
+  - name: Events
+    description: Pipeline event injection
+  - name: Debug
+    description: GStreamer debug control
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check endpoint
+      description: |
+        Lightweight health check that bypasses the thread pool for fast responses.
+        Suitable for Kubernetes liveness and readiness probes.
+
+        **Note:** This endpoint is custom to this fork and not available in upstream gstd.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                code: 0
+                description: OK
+                response:
+                  status: healthy
+
+  /pipelines:
+    get:
+      tags:
+        - Pipelines
+      summary: List all pipelines
+      description: Returns a list of all created pipelines
+      operationId: listPipelines
+      responses:
+        '200':
+          description: List of pipelines
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineListResponse'
+    post:
+      tags:
+        - Pipelines
+      summary: Create a new pipeline
+      description: Creates a new GStreamer pipeline with the given description
+      operationId: createPipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePipelineRequest'
+            example:
+              name: mypipeline
+              description: videotestsrc ! autovideosink
+      responses:
+        '200':
+          description: Pipeline created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineResponse'
+        '400':
+          description: Bad pipeline description
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Pipeline with this name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Pipelines
+      summary: Get pipeline details
+      description: Returns details about a specific pipeline
+      operationId: getPipeline
+      responses:
+        '200':
+          description: Pipeline details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - Pipelines
+      summary: Delete a pipeline
+      description: Deletes an existing pipeline
+      operationId: deletePipeline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Pipeline name to delete
+      responses:
+        '200':
+          description: Pipeline deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/state:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - State
+      summary: Get pipeline state
+      description: Returns the current state of the pipeline
+      operationId: getPipelineState
+      responses:
+        '200':
+          description: Pipeline state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StateResponse'
+              example:
+                code: 0
+                description: Success
+                response:
+                  value: PAUSED
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - State
+      summary: Set pipeline state
+      description: Changes the pipeline state (null, ready, paused, playing)
+      operationId: setPipelineState
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  enum:
+                    - null
+                    - ready
+                    - paused
+                    - playing
+                  description: Target state
+            example:
+              name: playing
+      responses:
+        '200':
+          description: State changed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Invalid state value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/elements:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Elements
+      summary: List pipeline elements
+      description: Returns a list of elements in the pipeline
+      operationId: listElements
+      responses:
+        '200':
+          description: List of elements
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ElementListResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+    get:
+      tags:
+        - Elements
+      summary: Get element details
+      description: Returns details about a specific element
+      operationId: getElement
+      responses:
+        '200':
+          description: Element details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ElementResponse'
+        '404':
+          description: Element not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}/properties:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+    get:
+      tags:
+        - Properties
+      summary: List element properties
+      description: Returns all properties of an element
+      operationId: listProperties
+      responses:
+        '200':
+          description: List of properties
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyListResponse'
+        '404':
+          description: Element not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}/properties/{property_name}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+      - $ref: '#/components/parameters/PropertyName'
+    get:
+      tags:
+        - Properties
+      summary: Get property value
+      description: Returns the current value of an element property
+      operationId: getProperty
+      responses:
+        '200':
+          description: Property value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+        '404':
+          description: Property not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - Properties
+      summary: Set property value
+      description: Updates the value of an element property
+      operationId: setProperty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: New property value
+            example:
+              name: "640"
+      responses:
+        '200':
+          description: Property updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Invalid property value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Property not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/bus/message:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Bus
+      summary: Read bus message
+      description: Reads the next message from the pipeline bus
+      operationId: readBusMessage
+      responses:
+        '200':
+          description: Bus message
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BusMessageResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/bus/timeout:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Bus
+      summary: Get bus timeout
+      description: Returns the current bus read timeout in nanoseconds
+      operationId: getBusTimeout
+      responses:
+        '200':
+          description: Bus timeout value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+    put:
+      tags:
+        - Bus
+      summary: Set bus timeout
+      description: Sets the bus read timeout in nanoseconds (-1 for infinite)
+      operationId: setBusTimeout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Timeout in nanoseconds
+            example:
+              name: "1000000000"
+      responses:
+        '200':
+          description: Timeout updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /pipelines/{pipeline_name}/bus/types:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Bus
+      summary: Get bus message filter
+      description: Returns the current bus message type filter
+      operationId: getBusFilter
+      responses:
+        '200':
+          description: Bus filter value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+    put:
+      tags:
+        - Bus
+      summary: Set bus message filter
+      description: Sets which message types to receive from the bus
+      operationId: setBusFilter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Message type filter (e.g., "eos+error+warning")
+      responses:
+        '200':
+          description: Filter updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}/signals:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+    get:
+      tags:
+        - Signals
+      summary: List element signals
+      description: Returns all signals available on an element
+      operationId: listSignals
+      responses:
+        '200':
+          description: List of signals
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignalListResponse'
+        '404':
+          description: Element not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}/signals/{signal_name}:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+      - $ref: '#/components/parameters/SignalName'
+    post:
+      tags:
+        - Signals
+      summary: Connect to signal
+      description: Connects to an element signal to receive callbacks
+      operationId: connectSignal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Signal callback name
+      responses:
+        '200':
+          description: Signal connected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+    delete:
+      tags:
+        - Signals
+      summary: Disconnect from signal
+      description: Disconnects from an element signal
+      operationId: disconnectSignal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Signal callback name
+      responses:
+        '200':
+          description: Signal disconnected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /pipelines/{pipeline_name}/event:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    post:
+      tags:
+        - Events
+      summary: Send event to pipeline
+      description: Injects an event into the pipeline (eos, flush_start, flush_stop, seek)
+      operationId: sendEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Event type
+                  enum:
+                    - eos
+                    - flush_start
+                    - flush_stop
+                description:
+                  type: string
+                  description: Event parameters (for seek events)
+            examples:
+              eos:
+                summary: End of stream
+                value:
+                  name: eos
+              flush_start:
+                summary: Flush start
+                value:
+                  name: flush_start
+              flush_stop:
+                summary: Flush stop
+                value:
+                  name: flush_stop
+              seek:
+                summary: Seek to position
+                value:
+                  name: seek
+                  description: "1.0 0 none 0 none 5000000000"
+      responses:
+        '200':
+          description: Event sent successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Invalid event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/graph:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Pipelines
+      summary: Get pipeline graph
+      description: Returns the pipeline graph in GraphViz DOT format for visualization
+      operationId: getPipelineGraph
+      responses:
+        '200':
+          description: Pipeline graph in DOT format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphResponse'
+        '404':
+          description: Pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /pipelines/{pipeline_name}/verbose:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+    get:
+      tags:
+        - Pipelines
+      summary: Get verbose mode
+      description: Returns whether verbose mode (deep notify) is enabled
+      operationId: getVerbose
+      responses:
+        '200':
+          description: Verbose mode status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+    put:
+      tags:
+        - Pipelines
+      summary: Set verbose mode
+      description: Enable or disable verbose mode (similar to -v in gst-launch-1.0)
+      operationId: setVerbose
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+            example:
+              name: "true"
+      responses:
+        '200':
+          description: Verbose mode updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /pipelines/{pipeline_name}/elements/{element_name}/signals/{signal_name}/timeout:
+    parameters:
+      - $ref: '#/components/parameters/PipelineName'
+      - $ref: '#/components/parameters/ElementName'
+      - $ref: '#/components/parameters/SignalName'
+    get:
+      tags:
+        - Signals
+      summary: Get signal timeout
+      description: Returns the current signal callback timeout
+      operationId: getSignalTimeout
+      responses:
+        '200':
+          description: Signal timeout value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyResponse'
+    put:
+      tags:
+        - Signals
+      summary: Set signal timeout
+      description: Sets the signal callback timeout
+      operationId: setSignalTimeout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Timeout value
+      responses:
+        '200':
+          description: Timeout updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /debug/enable:
+    put:
+      tags:
+        - Debug
+      summary: Enable/disable debug
+      description: Enable or disable GStreamer debug output
+      operationId: setDebugEnable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+            example:
+              name: "true"
+      responses:
+        '200':
+          description: Debug setting updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /debug/threshold:
+    put:
+      tags:
+        - Debug
+      summary: Set debug threshold
+      description: |
+        Set the GStreamer debug level threshold.
+
+        Levels:
+        - 0: NONE
+        - 1: ERROR
+        - 2: WARNING
+        - 3: FIXME
+        - 4: INFO
+        - 5: DEBUG
+        - 6: LOG
+        - 7: TRACE
+        - 9: MEMDUMP
+      operationId: setDebugThreshold
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  description: Debug level (0-9)
+            example:
+              name: "5"
+      responses:
+        '200':
+          description: Debug threshold updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /debug/color:
+    put:
+      tags:
+        - Debug
+      summary: Enable/disable debug colors
+      description: Enable or disable colored debug output
+      operationId: setDebugColor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+      responses:
+        '200':
+          description: Debug color setting updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+  /debug/reset:
+    put:
+      tags:
+        - Debug
+      summary: Reset debug thresholds
+      description: Clear all debug thresholds
+      operationId: resetDebug
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  enum:
+                    - "true"
+                    - "false"
+      responses:
+        '200':
+          description: Debug thresholds reset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+
+components:
+  parameters:
+    PipelineName:
+      name: pipeline_name
+      in: path
+      required: true
+      description: Name of the pipeline
+      schema:
+        type: string
+      example: mypipeline
+    ElementName:
+      name: element_name
+      in: path
+      required: true
+      description: Name of the element
+      schema:
+        type: string
+      example: videotestsrc0
+    PropertyName:
+      name: property_name
+      in: path
+      required: true
+      description: Name of the property
+      schema:
+        type: string
+      example: pattern
+    SignalName:
+      name: signal_name
+      in: path
+      required: true
+      description: Name of the signal
+      schema:
+        type: string
+
+  schemas:
+    BaseResponse:
+      type: object
+      required:
+        - code
+        - description
+      properties:
+        code:
+          type: integer
+          description: Return code (0 = success)
+        description:
+          type: string
+          description: Human-readable status message
+
+    SuccessResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              nullable: true
+      example:
+        code: 0
+        description: Success
+        response: null
+
+    ErrorResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              nullable: true
+      example:
+        code: 6
+        description: Resource requested doesn't exist
+        response: null
+
+    HealthResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - healthy
+
+    CreatePipelineRequest:
+      type: object
+      required:
+        - name
+        - description
+      properties:
+        name:
+          type: string
+          description: Unique pipeline name
+        description:
+          type: string
+          description: gst-launch-1.0 style pipeline description
+      example:
+        name: test_pipeline
+        description: videotestsrc ! videoconvert ! autovideosink
+
+    PipelineListResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+
+    GraphResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                value:
+                  type: string
+                  description: Pipeline graph in GraphViz DOT format
+      example:
+        code: 0
+        description: Success
+        response:
+          value: "digraph pipeline { ... }"
+
+    PipelineResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                state:
+                  type: string
+
+    StateResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                value:
+                  type: string
+                  enum:
+                    - NULL
+                    - READY
+                    - PAUSED
+                    - PLAYING
+
+    ElementListResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+
+    ElementResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                name:
+                  type: string
+
+    PropertyListResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      value:
+                        type: string
+
+    PropertyResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                value:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                    - type: boolean
+                    - type: number
+
+    BusMessageResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                type:
+                  type: string
+                  description: Message type (eos, error, warning, info, state-changed, etc.)
+                source:
+                  type: string
+                  description: Element that posted the message
+                timestamp:
+                  type: integer
+                  format: int64
+                  description: Timestamp in nanoseconds
+
+    SignalListResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+
+    ReturnCodes:
+      type: integer
+      description: |
+        GStreamer Daemon return codes:
+        - 0: Success (GSTD_EOK)
+        - 1: Required argument is NULL (GSTD_NULL_ARGUMENT)
+        - 2: Bad pipeline description (GSTD_BAD_DESCRIPTION)
+        - 3: Name already exists (GSTD_EXISTING_NAME)
+        - 4: Missing initialization (GSTD_MISSING_INITIALIZATION)
+        - 5: Pipeline doesn't exist (GSTD_NO_PIPELINE)
+        - 6: Resource doesn't exist (GSTD_NO_RESOURCE)
+        - 7: Cannot create in this resource (GSTD_NO_CREATE)
+        - 8: Resource already exists (GSTD_EXISTING_RESOURCE)
+        - 9: Cannot update this resource (GSTD_NO_UPDATE)
+        - 10: Bad command (GSTD_BAD_COMMAND)
+        - 11: Resource not readable (GSTD_NO_READ)
+        - 12: Cannot connect (GSTD_NO_CONNECTION)
+        - 13: Bad value (GSTD_BAD_VALUE)
+        - 14: State error (GSTD_STATE_ERROR)
+        - 15: IPC error (GSTD_IPC_ERROR)
+        - 16: Event error (GSTD_EVENT_ERROR)
+        - 17: Missing argument (GSTD_MISSING_ARGUMENT)
+        - 18: Missing name (GSTD_MISSING_NAME)
+      enum:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        - 18
