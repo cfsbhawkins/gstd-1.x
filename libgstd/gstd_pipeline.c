@@ -534,7 +534,10 @@ wrong_pipeline:
   {
     if (error) {
       GST_ERROR_OBJECT (self, "Unable to create pipeline: %s", error->message);
+      g_printerr ("gstd: Pipeline creation failed: %s\n", error->message);
       g_error_free (error);
+    } else {
+      g_printerr ("gstd: Pipeline creation failed (unknown error)\n");
     }
     return GSTD_BAD_DESCRIPTION;
   }

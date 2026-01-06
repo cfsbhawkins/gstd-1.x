@@ -238,7 +238,30 @@ gstd_state_update (GstdObject * object, const gchar * sstate)
 
   gstret = gst_element_set_state (self->target, state);
   if (GST_STATE_CHANGE_FAILURE == gstret) {
+    GstBus *bus;
+    GstMessage *msg;
+
     GST_ERROR_OBJECT (self, "Failed to change the state of the pipeline");
+
+    bus = gst_element_get_bus (self->target);
+    if (bus) {
+      msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+      if (msg) {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_error (msg, &err, &debug);
+        g_printerr ("gstd: State change failed: %s\n", err->message);
+        g_error_free (err);
+        g_free (debug);
+        gst_message_unref (msg);
+      } else {
+        g_printerr ("gstd: State change failed (no error on bus)\n");
+      }
+      gst_object_unref (bus);
+    } else {
+      g_printerr ("gstd: State change failed (no bus available)\n");
+    }
+
     return GSTD_STATE_ERROR;
   }
 
