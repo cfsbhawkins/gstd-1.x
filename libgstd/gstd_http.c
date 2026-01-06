@@ -466,6 +466,41 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
 
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
+handle_health_request (SoupServer * server, SoupMsg * msg)
+#else
+handle_health_request (SoupServer * server, SoupMessage * msg)
+#endif
+{
+  static const char *health_response =
+      "{\n  \"code\" : 0,\n  \"description\" : \"OK\",\n  \"response\" : {\"status\": \"healthy\"}\n}";
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Origin", "*");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Headers", "origin,range,content-type");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Methods", "GET");
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
+      health_response, strlen (health_response));
+  soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+  soup_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
+      health_response, strlen (health_response));
+  soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+}
+
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
 server_callback (SoupServer * server, SoupMsg * msg,
     const char *path, GHashTable * query, gpointer data)
 #else
@@ -482,6 +517,12 @@ server_callback (SoupServer * server, SoupMessage * msg,
   g_return_if_fail (server);
   g_return_if_fail (msg);
   g_return_if_fail (data);
+
+  /* Fast path for health checks - bypass thread pool */
+  if (g_strcmp0 (path, "/health") == 0) {
+    handle_health_request (server, msg);
+    return;
+  }
 
   self = GSTD_HTTP (data);
   session = self->session;
