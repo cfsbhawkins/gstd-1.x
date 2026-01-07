@@ -48,14 +48,19 @@ paths:
         - Health
       summary: Health check endpoint
       description: |
-        Lightweight health check that bypasses the thread pool for fast responses.
-        Suitable for Kubernetes liveness and readiness probes.
+        Health check that verifies GStreamer is responsive by creating and destroying
+        a canary pipeline (fakesrc ! fakesink). This proves the GStreamer runtime is
+        functional, not just that the HTTP server is up.
+
+        Suitable for Docker/Kubernetes liveness probes. If GStreamer is deadlocked,
+        the endpoint will hang (triggering a container restart via timeout). If
+        GStreamer is broken but responsive, returns 503.
 
         **Note:** This endpoint is custom to this fork and not available in upstream gstd.
       operationId: getHealth
       responses:
         '200':
-          description: Service is healthy
+          description: Service is healthy and GStreamer is responsive
           content:
             application/json:
               schema:
@@ -65,6 +70,17 @@ paths:
                 description: OK
                 response:
                   status: healthy
+        '503':
+          description: GStreamer is unresponsive or broken
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnhealthyResponse'
+              example:
+                code: 1
+                description: GStreamer unresponsive
+                response:
+                  status: unhealthy
 
   /pipelines:
     get:
@@ -952,6 +968,19 @@ components:
                   type: string
                   enum:
                     - healthy
+
+    UnhealthyResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum:
+                    - unhealthy
 
     CreatePipelineRequest:
       type: object

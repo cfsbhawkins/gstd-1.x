@@ -464,6 +464,44 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   g_object_unref (parser);
 }
 
+static gboolean
+gstreamer_is_responsive (void)
+{
+  GstElement *pipeline = NULL;
+  GstStateChangeReturn ret;
+  gboolean healthy = FALSE;
+
+  /* Create a minimal canary pipeline to verify GStreamer is functional */
+  pipeline = gst_parse_launch ("fakesrc num-buffers=1 ! fakesink", NULL);
+  if (!pipeline) {
+    GST_WARNING ("Health check: failed to create canary pipeline");
+    return FALSE;
+  }
+
+  /* Try to set to PLAYING - if GStreamer is locked, this will hang
+   * and Docker's health check timeout will trigger a restart */
+  ret = gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    GST_WARNING ("Health check: canary pipeline failed to start");
+    goto cleanup;
+  }
+
+  /* Wait for state change with a reasonable timeout */
+  ret = gst_element_get_state (pipeline, NULL, NULL, GST_SECOND);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    GST_WARNING ("Health check: canary pipeline state change failed");
+    goto cleanup;
+  }
+
+  healthy = TRUE;
+  GST_DEBUG ("Health check: GStreamer is responsive");
+
+cleanup:
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (pipeline);
+  return healthy;
+}
+
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
 handle_health_request (SoupServer * server, SoupMsg * msg)
@@ -473,7 +511,13 @@ handle_health_request (SoupServer * server, SoupMessage * msg)
 {
   static const char *health_response =
       "{\n  \"code\" : 0,\n  \"description\" : \"OK\",\n  \"response\" : {\"status\": \"healthy\"}\n}";
+  static const char *unhealthy_response =
+      "{\n  \"code\" : 1,\n  \"description\" : \"GStreamer unresponsive\",\n  \"response\" : {\"status\": \"unhealthy\"}\n}";
   SoupMessageHeaders *response_headers = NULL;
+  gboolean healthy;
+
+  /* Test that GStreamer is actually functional */
+  healthy = gstreamer_is_responsive ();
 
 #if SOUP_CHECK_VERSION(3,0,0)
   response_headers = soup_server_message_get_response_headers (msg);
@@ -490,12 +534,14 @@ handle_health_request (SoupServer * server, SoupMessage * msg)
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
-      health_response, strlen (health_response));
-  soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+      healthy ? health_response : unhealthy_response,
+      strlen (healthy ? health_response : unhealthy_response));
+  soup_server_message_set_status (msg, healthy ? SOUP_STATUS_OK : SOUP_STATUS_SERVICE_UNAVAILABLE, NULL);
 #else
   soup_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
-      health_response, strlen (health_response));
-  soup_message_set_status (msg, SOUP_STATUS_OK);
+      healthy ? health_response : unhealthy_response,
+      strlen (healthy ? health_response : unhealthy_response));
+  soup_message_set_status (msg, healthy ? SOUP_STATUS_OK : SOUP_STATUS_SERVICE_UNAVAILABLE);
 #endif
 }
 
