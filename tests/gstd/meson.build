@@ -4,6 +4,7 @@ gstd_tests = [
   ['test_gstd_pipeline_create.c'],
   ['test_gstd_session.c'],
   ['test_gstd_state.c'],
+  ['test_gstd_stability.c'],
 ]
 
 # Add C Definitions for tests

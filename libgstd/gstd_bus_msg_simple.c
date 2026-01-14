@@ -74,14 +74,13 @@ static GstdReturnCode
 gstd_bus_msg_simple_to_string (GstdBusMsg * msg, GstdIFormatter * formatter,
     GstMessage * target)
 {
-  GError *error;
-  gchar *debug;
+  GError *error = NULL;
+  gchar *debug = NULL;
 
   g_return_val_if_fail (msg, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (formatter, GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (target, GSTD_NULL_ARGUMENT);
 
-  error = NULL;
   switch (target->type) {
     case GST_MESSAGE_ERROR:
       gst_message_parse_error (target, &error, &debug);
@@ -93,20 +92,26 @@ gstd_bus_msg_simple_to_string (GstdBusMsg * msg, GstdIFormatter * formatter,
       gst_message_parse_info (target, &error, &debug);
       break;
     default:
+      GST_WARNING ("Unexpected message type %s in bus_msg_simple",
+          GST_MESSAGE_TYPE_NAME (target));
       return GSTD_EVENT_ERROR;
+  }
+
+  /* Validate parsed message before use */
+  if (!error) {
+    GST_WARNING ("Failed to parse error/warning/info message");
+    g_free (debug);
+    return GSTD_EVENT_ERROR;
   }
 
   gstd_iformatter_set_member_name (formatter, "message");
   gstd_iformatter_set_string_value (formatter, error->message);
 
   gstd_iformatter_set_member_name (formatter, "debug");
-  gstd_iformatter_set_string_value (formatter, debug);
+  gstd_iformatter_set_string_value (formatter, debug ? debug : "");
 
   g_error_free (error);
-
-  if (debug) {
-    g_free (debug);
-  }
+  g_free (debug);
 
   return GSTD_EOK;
 }

@@ -66,3 +66,20 @@ Tests are located in `tests/gstd/`, `tests/libgstc/`, and `tests/libgstd/`.
 
 This is a fork of RidgeRun/gstd-1.x.
 
+## Stability Improvements (v0.16.0)
+
+Key stability changes made in this fork:
+
+- **Thread pool limits**: Default max_threads changed from unlimited to 16 for HTTP/TCP
+- **Fast-path endpoints**: `/health` and `/pipelines/status` bypass thread pool
+- **Memory leak fixes**: Multiple fixes in HTTP, socket, pipeline, and action handlers
+- **Race condition fixes**: Mutex critical sections, thread pool cleanup
+- **GStreamer handling**: State query timeout (100ms), iterator resync limits, bus reference fixes
+
+## Key Files for Stability
+
+When investigating stability issues, focus on:
+- `libgstd/gstd_http.c` - HTTP server, thread pool, fast-path handlers
+- `libgstd/gstd_socket.c` - TCP connections, FD management
+- `libgstd/gstd_pipeline.c` - Pipeline lifecycle, bus handling
+- `libgstd/gstd_state.c` - State transitions, async handling
