@@ -119,6 +119,14 @@ http_get (const gchar * path, guint * status_code)
   }
 
   bytes_read = g_input_stream_read (istream, buffer, sizeof (buffer) - 1, NULL, NULL);
+  if (bytes_read < 0) {
+    /* Read error */
+    g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
+    g_object_unref (conn);
+    g_object_unref (client);
+    *status_code = 0;
+    return NULL;
+  }
   buffer[bytes_read] = '\0';
 
   /* Parse status code from HTTP response */

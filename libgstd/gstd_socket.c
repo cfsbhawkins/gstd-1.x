@@ -111,12 +111,14 @@ gstd_socket_callback (GSocketService * service,
   remote_addr = g_socket_connection_get_remote_address (connection, NULL);
   if (remote_addr && G_IS_INET_SOCKET_ADDRESS (remote_addr)) {
     GInetAddress *inet_addr;
+    gchar *addr_str;
     guint16 port;
     inet_addr = g_inet_socket_address_get_address (
         G_INET_SOCKET_ADDRESS (remote_addr));
     port = g_inet_socket_address_get_port (G_INET_SOCKET_ADDRESS (remote_addr));
-    client_info = g_strdup_printf ("%s:%u",
-        g_inet_address_to_string (inet_addr), port);
+    addr_str = g_inet_address_to_string (inet_addr);
+    client_info = g_strdup_printf ("%s:%u", addr_str, port);
+    g_free (addr_str);
     GST_DEBUG_OBJECT (session, "Client connected: %s", client_info);
     g_object_unref (remote_addr);
   } else {

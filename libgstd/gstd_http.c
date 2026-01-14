@@ -417,6 +417,11 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   gsize body_length = 0;
   SoupMessageBody *request_body = NULL;
   SoupMessageHeaders *request_headers = NULL;
+#if SOUP_CHECK_VERSION(3,0,0)
+  GBytes *body_bytes = NULL;
+#else
+  SoupBuffer *body_buffer = NULL;
+#endif
 
   g_return_if_fail (msg);
   g_return_if_fail (out_name);
@@ -437,24 +442,42 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     return;
   }
 
-  soup_message_body_flatten (request_body);
-  if (request_body->length == 0) {
+#if SOUP_CHECK_VERSION(3,0,0)
+  /* libsoup3: use GBytes API for body access */
+  body_bytes = soup_message_body_flatten (request_body);
+  if (!body_bytes) {
     return;
   }
+  body_data = g_bytes_get_data (body_bytes, &body_length);
+  if (body_length == 0) {
+    g_bytes_unref (body_bytes);
+    return;
+  }
+#else
+  /* libsoup2: flatten returns SoupBuffer, access via buffer */
+  body_buffer = soup_message_body_flatten (request_body);
+  if (!body_buffer) {
+    return;
+  }
+  body_data = body_buffer->data;
+  body_length = body_buffer->length;
+  if (body_length == 0) {
+    soup_buffer_free (body_buffer);
+    return;
+  }
+#endif
 
-  body_data = request_body->data;
-  body_length = request_body->length;
   content_type = soup_message_headers_get_content_type (request_headers, NULL);
 
   if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
-    return;
+    goto out;
   }
 
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
     g_clear_error (&err);
     g_object_unref (parser);
-    return;
+    goto out;
   }
 
   root = json_parser_get_root (parser);
@@ -470,6 +493,17 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     }
   }
   g_object_unref (parser);
+
+out:
+#if SOUP_CHECK_VERSION(3,0,0)
+  if (body_bytes) {
+    g_bytes_unref (body_bytes);
+  }
+#else
+  if (body_buffer) {
+    soup_buffer_free (body_buffer);
+  }
+#endif
 }
 
 static void
