@@ -660,3 +660,10 @@ gstd_pipeline_decrement_refcount (GstdPipeline * self)
   GST_OBJECT_UNLOCK (self);
   return GSTD_EOK;
 }
+
+GstElement *
+gstd_pipeline_get_element (GstdPipeline * self)
+{
+  g_return_val_if_fail (self, NULL);
+  return self->pipeline;
+}

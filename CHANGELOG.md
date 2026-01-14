@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-01-14
+
+### Added
+- Docker support for local test execution
+  - Added `Dockerfile` with Ubuntu 22.04 and all build dependencies
+  - Added `docker-test.sh` helper script for running test suite
+
+### Fixed
+- **Build error: Incomplete type access in HTTP handler** (`gstd_http.c`)
+  - Added `gstd_pipeline_get_element()` accessor function to `gstd_pipeline.h`
+  - Replaced direct struct field access with accessor for proper encapsulation
+  - Fixes compilation with libsoup 3.0.x
+
+- **Build warning: Incorrect libsoup version checks** (`gstd_http.c`)
+  - Fixed version macro usage for `soup_server_message_set_status()` (needs 3.0.0)
+  - Fixed version macro usage for `soup_server_message_unpause()` (needs 3.2.0)
+  - Properly handles libsoup 3.0.x which has different API than 3.2.x
+
+- **Thread safety: State refcount race condition** (`gstd_state.c`)
+  - Added `GST_OBJECT_LOCK/UNLOCK` around refcount operations
+  - Matches thread-safe pattern used in `gstd_pipeline.c`
+
+- **Bug: CORS headers not set on HTTP responses** (`gstd_http.c`)
+  - Fixed `soup_server_message_get_request_headers()` → `soup_server_message_get_response_headers()`
+  - CORS headers were being appended to wrong header collection in libsoup 3.0+
+
+- **Memory leak: Session property setter** (`gstd_session.c`)
+  - Added `g_object_unref()` for previous value before setting new pipelines/debug objects
+  - Prevents leak when properties are set multiple times
+
 ## [0.16.0] - 2026-01-14
 
 ### Added
