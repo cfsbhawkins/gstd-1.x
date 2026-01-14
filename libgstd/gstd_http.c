@@ -558,8 +558,9 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
     name = GSTD_OBJECT_NAME (pipeline);
 
     /* Get current pipeline state directly from GStreamer */
-    if (pipeline->pipeline) {
-      gst_element_get_state (pipeline->pipeline, &current_state, NULL, 0);
+    GstElement *element = gstd_pipeline_get_element (pipeline);
+    if (element) {
+      gst_element_get_state (element, &current_state, NULL, 0);
     }
 
     if (!first) {
@@ -642,7 +643,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
 
 #if SOUP_CHECK_VERSION(3,0,0)
-  response_headers = soup_server_message_get_request_headers (msg);
+  response_headers = soup_server_message_get_response_headers (msg);
 #else
   response_headers = msg->response_headers;
 #endif
@@ -668,11 +669,14 @@ server_callback (SoupServer * server, SoupMessage * msg,
     g_free (data_request);
     /* Unpause the message so libsoup can complete it with an error */
     g_mutex_lock (&self->mutex);
-#if SOUP_CHECK_VERSION(3,2,0)
+#if SOUP_CHECK_VERSION(3,0,0)
     soup_server_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE, NULL);
-    soup_server_message_unpause (msg);
 #else
     soup_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE);
+#endif
+#if SOUP_CHECK_VERSION(3,2,0)
+    soup_server_message_unpause (msg);
+#else
     soup_server_unpause_message (server, msg);
 #endif
     g_mutex_unlock (&self->mutex);

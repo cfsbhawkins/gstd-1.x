@@ -342,7 +342,9 @@ GstdReturnCode
 gstd_state_increment_refcount (GstdState * self)
 {
   g_return_val_if_fail (self, GSTD_NULL_ARGUMENT);
+  GST_OBJECT_LOCK (self);
   self->refcount++;
+  GST_OBJECT_UNLOCK (self);
   return GSTD_EOK;
 }
 
@@ -350,8 +352,10 @@ GstdReturnCode
 gstd_state_decrement_refcount (GstdState * self)
 {
   g_return_val_if_fail (self, GSTD_NULL_ARGUMENT);
+  GST_OBJECT_LOCK (self);
   if (0 < self->refcount) {
     self->refcount--;
   }
+  GST_OBJECT_UNLOCK (self);
   return GSTD_EOK;
 }
