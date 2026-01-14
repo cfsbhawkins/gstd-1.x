@@ -230,6 +230,7 @@ gstd_state_update (GstdObject * object, const gchar * sstate)
   g_value_init (&value, GSTD_TYPE_STATE_ENUM);
   if (!gst_value_deserialize (&value, sstate)) {
     GST_ERROR_OBJECT (self, "Unable to interpret \"%s\" as a state", sstate);
+    g_value_unset (&value);
     return GSTD_BAD_VALUE;
   }
 
