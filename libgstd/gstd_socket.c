@@ -85,17 +85,20 @@ static gboolean
 gstd_socket_callback (GSocketService * service,
     GSocketConnection * connection, GObject * source_object, gpointer user_data)
 {
-
   GstdSession *session;
   GInputStream *istream;
   GOutputStream *ostream;
   gint read;
   const guint size = 1024 * 1024;
   gchar *output = NULL;
-  gchar *response;
+  gchar *response = NULL;
   gchar *message;
   GstdReturnCode ret;
   const gchar *description = NULL;
+  GError *error = NULL;
+  GSocketAddress *remote_addr = NULL;
+  gchar *client_info = NULL;
+  guint command_count = 0;
 
   g_return_val_if_fail (service, FALSE);
   g_return_val_if_fail (connection, FALSE);
@@ -104,21 +107,63 @@ gstd_socket_callback (GSocketService * service,
   session = GSTD_SESSION (user_data);
   g_return_val_if_fail (session, FALSE);
 
+  /* Log client connection */
+  remote_addr = g_socket_connection_get_remote_address (connection, NULL);
+  if (remote_addr && G_IS_INET_SOCKET_ADDRESS (remote_addr)) {
+    GInetAddress *inet_addr;
+    gchar *addr_str;
+    guint16 port;
+    inet_addr = g_inet_socket_address_get_address (
+        G_INET_SOCKET_ADDRESS (remote_addr));
+    port = g_inet_socket_address_get_port (G_INET_SOCKET_ADDRESS (remote_addr));
+    addr_str = g_inet_address_to_string (inet_addr);
+    client_info = g_strdup_printf ("%s:%u", addr_str, port);
+    g_free (addr_str);
+    GST_DEBUG_OBJECT (session, "Client connected: %s", client_info);
+    g_object_unref (remote_addr);
+  } else {
+    client_info = g_strdup ("unknown");
+    GST_DEBUG_OBJECT (session, "Client connected (address unavailable)");
+    if (remote_addr)
+      g_object_unref (remote_addr);
+  }
+
   istream = g_io_stream_get_input_stream (G_IO_STREAM (connection));
   ostream = g_io_stream_get_output_stream (G_IO_STREAM (connection));
 
   message = g_malloc (size);
 
   while (TRUE) {
-    read = g_input_stream_read (istream, message, size, NULL, NULL);
+    read = g_input_stream_read (istream, message, size, NULL, &error);
 
-    /* Was connection closed? */
+    /* Was connection closed or error? */
     if (read <= 0) {
+      if (read < 0 && error) {
+        GST_WARNING_OBJECT (session, "Read error from %s: %s",
+            client_info, error->message);
+        g_error_free (error);
+        error = NULL;
+      } else if (read == 0) {
+        GST_DEBUG_OBJECT (session, "Client %s closed connection after %u commands",
+            client_info, command_count);
+      }
       break;
     }
     message[read] = '\0';
+    command_count++;
 
-    ret = gstd_parser_parse_cmd (session, message, &output);    // in the parser
+    GST_DEBUG_OBJECT (session, "Received command from %s: %.80s%s",
+        client_info, message, strlen (message) > 80 ? "..." : "");
+
+    ret = gstd_parser_parse_cmd (session, message, &output);
+
+    /* Log command result at appropriate level */
+    if (ret != GSTD_EOK) {
+      GST_WARNING_OBJECT (session, "Command from %s failed: %s (code %d)",
+          client_info, gstd_return_code_to_string (ret), ret);
+    } else {
+      GST_DEBUG_OBJECT (session, "Command from %s succeeded", client_info);
+    }
 
     /* Prepend the code to the output */
     description = gstd_return_code_to_string (ret);
@@ -131,14 +176,35 @@ gstd_socket_callback (GSocketService * service,
 
     read =
         g_output_stream_write (ostream, response, strlen (response) + 1, NULL,
-        NULL);
+        &error);
+    g_free (response);
+    response = NULL;
+
     if (read < 0) {
+      if (error) {
+        GST_WARNING_OBJECT (session, "Write error to %s: %s",
+            client_info, error->message);
+        g_error_free (error);
+        error = NULL;
+      }
       break;
     }
-    g_free (response);
   }
 
   g_free (message);
+
+  /* Properly close the connection to release file descriptors */
+  if (!g_io_stream_close (G_IO_STREAM (connection), NULL, &error)) {
+    if (error) {
+      GST_WARNING_OBJECT (session, "Error closing connection to %s: %s",
+          client_info, error->message);
+      g_error_free (error);
+    }
+  }
+
+  GST_DEBUG_OBJECT (session, "Client disconnected: %s (processed %u commands)",
+      client_info, command_count);
+  g_free (client_info);
 
   return TRUE;
 }
@@ -184,15 +250,13 @@ gstd_socket_stop (GstdIpc * base)
   GST_DEBUG_OBJECT (self, "Entering SOCKET stop ");
   if (self->service) {
     service = self->service;
+    self->service = NULL;  /* Clear before cleanup to prevent double-free */
     listener = G_SOCKET_LISTENER (service);
-    if (service) {
-      GST_INFO_OBJECT (session, "Closing SOCKET connection for %s",
-          GSTD_OBJECT_NAME (session));
-      g_socket_listener_close (listener);
-      g_socket_service_stop (service);
-      g_object_unref (service);
-      service = NULL;
-    }
+    GST_INFO_OBJECT (session, "Closing SOCKET connection for %s",
+        GSTD_OBJECT_NAME (session));
+    g_socket_listener_close (listener);
+    g_socket_service_stop (service);
+    g_object_unref (service);
   }
   return GSTD_EOK;
 }

@@ -1,0 +1,38 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies including valgrind
+RUN apt-get update && apt-get install -y \
+    automake \
+    libtool \
+    pkg-config \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libglib2.0-dev \
+    libjson-glib-dev \
+    gtk-doc-tools \
+    libedit-dev \
+    libncursesw5-dev \
+    libdaemon-dev \
+    libjansson-dev \
+    libsoup-3.0-dev \
+    python3-pip \
+    python3-setuptools \
+    ninja-build \
+    meson \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /gstd
+
+# Copy source code
+COPY . .
+
+# Build with debug symbols for better valgrind output
+RUN meson setup build -Dbuildtype=debug && ninja -C build
+
+# Default: run tests under valgrind
+CMD ["sh", "-c", "cd build && meson test --wrap='valgrind --leak-check=full --suppressions=/gstd/tests/gstd.supp --error-exitcode=1'"]

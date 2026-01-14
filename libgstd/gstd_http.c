@@ -30,6 +30,8 @@
 
 #include "gstd_http.h"
 #include "gstd_parser.h"
+#include "gstd_pipeline.h"
+#include "gstd_session.h"
 
 /* Gstd HTTP debugging category */
 GST_DEBUG_CATEGORY_STATIC (gstd_http_debug);
@@ -317,13 +319,19 @@ do_request (gpointer data_request, gpointer eval)
   g_return_if_fail (data_request);
 
   data_request_local = (GstdHttpRequest *) data_request;
+
+  /*
+   * Extract all fields from the request struct atomically.
+   * The struct may be accessed from multiple threads, so we need
+   * to copy everything we need under the lock.
+   */
   g_mutex_lock (data_request_local->mutex);
   server = data_request_local->server;
-  g_mutex_unlock (data_request_local->mutex);
   msg = data_request_local->msg;
   session = data_request_local->session;
   path = data_request_local->path;
   query = data_request_local->query;
+  g_mutex_unlock (data_request_local->mutex);
 
   parse_json_body (msg, &name, &description_pipe);
 
@@ -392,7 +400,7 @@ do_request (gpointer data_request, gpointer eval)
   if (query != NULL) {
     g_hash_table_unref (query);
   }
-  free (data_request);
+  g_free (data_request);
   data_request = NULL;
 
   return;
@@ -409,6 +417,11 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   gsize body_length = 0;
   SoupMessageBody *request_body = NULL;
   SoupMessageHeaders *request_headers = NULL;
+#if SOUP_CHECK_VERSION(3,0,0)
+  GBytes *body_bytes = NULL;
+#else
+  SoupBuffer *body_buffer = NULL;
+#endif
 
   g_return_if_fail (msg);
   g_return_if_fail (out_name);
@@ -429,24 +442,42 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     return;
   }
 
-  soup_message_body_flatten (request_body);
-  if (request_body->length == 0) {
+#if SOUP_CHECK_VERSION(3,0,0)
+  /* libsoup3: use GBytes API for body access */
+  body_bytes = soup_message_body_flatten (request_body);
+  if (!body_bytes) {
     return;
   }
+  body_data = g_bytes_get_data (body_bytes, &body_length);
+  if (body_length == 0) {
+    g_bytes_unref (body_bytes);
+    return;
+  }
+#else
+  /* libsoup2: flatten returns SoupBuffer, access via buffer */
+  body_buffer = soup_message_body_flatten (request_body);
+  if (!body_buffer) {
+    return;
+  }
+  body_data = body_buffer->data;
+  body_length = body_buffer->length;
+  if (body_length == 0) {
+    soup_buffer_free (body_buffer);
+    return;
+  }
+#endif
 
-  body_data = request_body->data;
-  body_length = request_body->length;
   content_type = soup_message_headers_get_content_type (request_headers, NULL);
 
   if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
-    return;
+    goto out;
   }
 
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
     g_clear_error (&err);
     g_object_unref (parser);
-    return;
+    goto out;
   }
 
   root = json_parser_get_root (parser);
@@ -462,6 +493,17 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     }
   }
   g_object_unref (parser);
+
+out:
+#if SOUP_CHECK_VERSION(3,0,0)
+  if (body_bytes) {
+    g_bytes_unref (body_bytes);
+  }
+#else
+  if (body_buffer) {
+    soup_buffer_free (body_buffer);
+  }
+#endif
 }
 
 static void
@@ -501,6 +543,90 @@ handle_health_request (SoupServer * server, SoupMessage * msg)
 #endif
 }
 
+/*
+ * Fast-path handler for pipeline status polling.
+ * This bypasses the thread pool to avoid contention during frequent
+ * monitoring requests. Returns a lightweight JSON with pipeline names
+ * and states only.
+ */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+handle_pipelines_status (SoupServer * server, SoupMsg * msg,
+    GstdSession * session)
+#else
+handle_pipelines_status (SoupServer * server, SoupMessage * msg,
+    GstdSession * session)
+#endif
+{
+  GString *json;
+  GList *pipelines;
+  GList *iter;
+  gboolean first = TRUE;
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Origin", "*");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Headers", "origin,range,content-type");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Methods", "GET");
+
+  json = g_string_new ("{\n  \"code\" : 0,\n  \"description\" : \"OK\",\n");
+  g_string_append (json, "  \"response\" : {\n    \"pipelines\": [");
+
+  /* Lock the list while iterating to prevent concurrent modification */
+  GST_OBJECT_LOCK (session->pipelines);
+  pipelines = session->pipelines->list;
+
+  for (iter = pipelines; iter != NULL; iter = g_list_next (iter)) {
+    GstdPipeline *pipeline = GSTD_PIPELINE (iter->data);
+    const gchar *name;
+    GstState current_state = GST_STATE_NULL;
+
+    name = GSTD_OBJECT_NAME (pipeline);
+
+    /* Get current pipeline state directly from GStreamer */
+    GstElement *element = gstd_pipeline_get_element (pipeline);
+    if (element) {
+      gst_element_get_state (element, &current_state, NULL, 0);
+    }
+
+    if (!first) {
+      g_string_append (json, ",");
+    }
+    first = FALSE;
+
+    g_string_append_printf (json,
+        "\n      {\"name\": \"%s\", \"state\": \"%s\"}",
+        name,
+        gst_element_state_get_name (current_state));
+  }
+
+  GST_OBJECT_UNLOCK (session->pipelines);
+
+  g_string_append (json, "\n    ],\n    \"count\": ");
+  g_string_append_printf (json, "%u", session->pipelines->count);
+  g_string_append (json, "\n  }\n}");
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
+      json->str, json->len);
+  soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+  soup_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
+      json->str, json->len);
+  soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+
+  g_string_free (json, TRUE);
+}
+
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
 server_callback (SoupServer * server, SoupMsg * msg,
@@ -529,7 +655,14 @@ server_callback (SoupServer * server, SoupMessage * msg,
   self = GSTD_HTTP (data);
   session = self->session;
 
-  data_request = (GstdHttpRequest *) malloc (sizeof (GstdHttpRequest));
+  /* Fast path for pipeline status polling - bypass thread pool.
+   * This endpoint is optimized for frequent monitoring requests. */
+  if (g_strcmp0 (path, "/pipelines/status") == 0) {
+    handle_pipelines_status (server, msg, session);
+    return;
+  }
+
+  data_request = g_new0 (GstdHttpRequest, 1);
 
   data_request->msg = msg;
   data_request->server = server;
@@ -544,7 +677,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
 
 #if SOUP_CHECK_VERSION(3,0,0)
-  response_headers = soup_server_message_get_request_headers (msg);
+  response_headers = soup_server_message_get_response_headers (msg);
 #else
   response_headers = msg->response_headers;
 #endif
@@ -562,7 +695,25 @@ server_callback (SoupServer * server, SoupMessage * msg,
 #endif
   g_mutex_unlock (&self->mutex);
   if (!g_thread_pool_push (self->pool, (gpointer) data_request, NULL)) {
-    GST_ERROR_OBJECT (self->pool, "Thread pool push failed");
+    GST_ERROR_OBJECT (self, "Thread pool push failed");
+    /* Clean up the request that couldn't be queued */
+    if (data_request->query) {
+      g_hash_table_unref (data_request->query);
+    }
+    g_free (data_request);
+    /* Unpause the message so libsoup can complete it with an error */
+    g_mutex_lock (&self->mutex);
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE, NULL);
+#else
+    soup_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE);
+#endif
+#if SOUP_CHECK_VERSION(3,2,0)
+    soup_server_message_unpause (msg);
+#else
+    soup_server_unpause_message (server, msg);
+#endif
+    g_mutex_unlock (&self->mutex);
   }
 
 }
@@ -599,12 +750,22 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   }
 
   sa = g_inet_socket_address_new_from_string (address, port);
+  if (!sa) {
+    g_printerr ("gstd: Invalid HTTP address: %s\n", address);
+    goto noconnection;
+  }
 
   soup_server_listen (self->server, sa, 0, &error);
+
+  /* sa is no longer needed after soup_server_listen */
+  g_object_unref (sa);
+  sa = NULL;
 
   if (error) {
     goto noconnection;
   }
+
+  GST_INFO_OBJECT (self, "HTTP server listening on %s:%u", address, port);
 
   soup_server_add_handler (self->server, NULL, server_callback, self, NULL);
 
@@ -612,12 +773,20 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
 
 noconnection:
   {
-    GST_ERROR_OBJECT (self, "%s", error->message);
-    g_printerr ("%s\n", error->message);
-    g_error_free (error);
-    error = NULL;
-    g_object_unref (self->server);
-    self->server = NULL;
+    if (error) {
+      GST_ERROR_OBJECT (self, "%s", error->message);
+      g_printerr ("%s\n", error->message);
+      g_error_free (error);
+      error = NULL;
+    }
+    if (self->pool) {
+      g_thread_pool_free (self->pool, TRUE, FALSE);
+      self->pool = NULL;
+    }
+    if (self->server) {
+      g_object_unref (self->server);
+      self->server = NULL;
+    }
     return GSTD_NO_CONNECTION;
   }
 }
@@ -662,15 +831,18 @@ static GstdReturnCode
 gstd_http_stop (GstdIpc * base)
 {
   GstdHttp *self = NULL;
-  GstdSession *session = NULL;
 
   g_return_val_if_fail (base, GSTD_NULL_ARGUMENT);
 
   self = GSTD_HTTP (base);
-  session = base->session;
 
-  GST_INFO_OBJECT (session, "Closing HTTP server connection for %s",
-      GSTD_OBJECT_NAME (session));
+  GST_DEBUG_OBJECT (self, "Stopping HTTP server");
+
+  /* Wait for pending requests before destroying the pool */
+  if (self->pool) {
+    g_thread_pool_free (self->pool, FALSE, TRUE);  /* wait=TRUE for clean shutdown */
+    self->pool = NULL;
+  }
 
   if (self->server) {
     g_object_unref (self->server);

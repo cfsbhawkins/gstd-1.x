@@ -1,0 +1,255 @@
+# Valgrind suppression file for gstd tests
+# GStreamer, GLib, and GObject have intentional "leaks" from:
+# - Type system registration (one-time allocations)
+# - Static string interning
+# - Plugin loading
+
+# GLib type system - registrations are permanent by design
+{
+   glib_type_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_type_register_*
+}
+
+{
+   glib_type_class_ref
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_type_class_ref
+}
+
+{
+   glib_type_create_instance
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_type_create_instance
+}
+
+# GObject class initialization
+{
+   gobject_class_init
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_type_class_*
+}
+
+# GLib quark/string interning - permanent by design
+{
+   glib_quark_from_string
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_quark_from_string
+}
+
+{
+   glib_quark_from_static_string
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_quark_from_static_string
+}
+
+{
+   glib_intern_string
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_intern_*string
+}
+
+# GLib slice allocator - may show as leaks but are pooled
+{
+   glib_slice_alloc
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_slice_alloc*
+}
+
+# GStreamer plugin loading - plugins stay loaded
+{
+   gst_plugin_load
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_plugin_load*
+}
+
+{
+   gst_plugin_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_plugin_register*
+}
+
+# GStreamer element factory registration
+{
+   gst_element_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_element_register
+}
+
+{
+   gst_element_factory
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_element_factory_*
+}
+
+# GStreamer type registration
+{
+   gst_type_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_*_get_type
+}
+
+# GStreamer init - one-time setup
+{
+   gst_init
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_init*
+}
+
+{
+   gst_registry
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_registry_*
+}
+
+# GStreamer debug system
+{
+   gst_debug_category
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:gst_debug_category_*
+}
+
+{
+   gst_debug_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:_gst_debug_*
+}
+
+# GLib main context - often one per thread, permanent
+{
+   glib_main_context
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_main_context_*
+}
+
+# GLib thread pool internals
+{
+   glib_thread_pool
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_thread_pool_*
+}
+
+# Pthreads - thread-local storage
+{
+   pthread_create
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:pthread_create*
+}
+
+# dlopen - shared library loading
+{
+   dlopen
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:dlopen*
+}
+
+{
+   dl_open
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:_dl_open
+}
+
+# GEnum/GFlags registration - permanent
+{
+   g_enum_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_enum_register_static
+}
+
+{
+   g_flags_register
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_flags_register_static
+}
+
+# libsoup internals
+{
+   soup_session
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:soup_*
+}
+
+# JSON-GLib type registration
+{
+   json_glib_types
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:json_*_get_type
+}
+
+# GIO types
+{
+   gio_types
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:g_*_get_type
+}
+
+# Check test framework
+{
+   check_framework
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:srunner_*
+}
+
+{
+   check_suite
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:suite_*
+}

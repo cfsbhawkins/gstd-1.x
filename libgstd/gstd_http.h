@@ -25,7 +25,8 @@
 G_BEGIN_DECLS
 #define GSTD_HTTP_DEFAULT_ADDRESS "127.0.0.1"
 #define GSTD_HTTP_DEFAULT_PORT 5001
-#define GSTD_HTTP_DEFAULT_MAX_THREADS -1
+/* Default to 16 threads. Use -1 for unlimited (not recommended for production) */
+#define GSTD_HTTP_DEFAULT_MAX_THREADS 16
 
 #define GSTD_TYPE_HTTP \
   (gstd_http_get_type())
