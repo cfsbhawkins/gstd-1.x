@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `Dockerfile` with Ubuntu 22.04 and all build dependencies
   - Added `docker-test.sh` helper script for running test suite
 
+- Valgrind memory leak testing support
+  - Added `Dockerfile.valgrind` for running tests under valgrind
+  - Added `docker-valgrind.sh` script for easy leak checking
+  - Added `tests/gstd.supp` suppression file for GStreamer/GLib known allocations
+  - Usage: `./docker-valgrind.sh` (all tests) or `./docker-valgrind.sh test_name`
+
 ### Fixed
 - **Build error: Incomplete type access in HTTP handler** (`gstd_http.c`)
   - Added `gstd_pipeline_get_element()` accessor function to `gstd_pipeline.h`
@@ -60,9 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `g_strsplit(..., query.n_params)` hid extra arguments in last token
   - Now splits with no limit and properly validates argument count
 
+- **Memory leak: g_value_unset not called** (`gstd_property_flags.c`)
+  - `g_value_init()` was called but `g_value_unset()` was never called before return
+  - Prevents memory leak on every flags property update in long-running daemons
+
 - **Memory leak: g_inet_address_to_string not freed** (`gstd_socket.c`)
   - Address string leaked on each client connection
   - Now properly freed after use
+
+### Improved
+- **Logging for unhandled bus message types** (`gstd_bus_msg.c`)
+  - Added GST_DEBUG logging for message types without specialized handlers
+  - Helps diagnose missing message handling in production (enable with `GST_DEBUG=gstd*:5`)
 
 ### Tests
 - Added `test_gstd_refcount.c` with new thread safety tests:
