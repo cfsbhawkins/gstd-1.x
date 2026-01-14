@@ -229,10 +229,13 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   }
 
   if (description) {
-    arg_list = g_strsplit (description, " ", query.n_params);
+    /* Split with no limit to detect extra arguments */
+    arg_list = g_strsplit (description, " ", -1);
   }
 
   if (arg_list && g_strv_length (arg_list) != query.n_params) {
+    GST_WARNING ("Action expects %u arguments but got %u",
+        query.n_params, g_strv_length (arg_list));
     g_strfreev (arg_list);
     return GSTD_NULL_ARGUMENT;
   }
@@ -244,11 +247,16 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   /* One additional value to store the instance as first value */
   args = g_new0 (GValue, query.n_params + 1);
 
+  /* Track number of initialized GValues for proper cleanup */
+  guint initialized_count = 0;
+
   g_value_init (&args[0], G_TYPE_OBJECT);
   g_value_set_object (&args[0], action->target);
+  initialized_count = 1;
 
   for (guint i = 0; i < query.n_params; i++) {
     g_value_init (&args[i + 1], query.param_types[i]);
+    initialized_count++;
 
     if (query.param_types[i] == G_TYPE_STRING) {
       g_value_set_string (&args[i + 1], arg_list[i]);
@@ -283,7 +291,8 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   }
 
 out:
-  for (guint i = 0; i <= query.n_params; i++)
+  /* Only unset GValues that were actually initialized */
+  for (guint i = 0; i < initialized_count; i++)
     g_value_unset (&args[i]);
   g_free (args);
   g_strfreev (arg_list);

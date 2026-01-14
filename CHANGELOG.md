@@ -44,6 +44,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixed race where `g_object_ref()` could be called on finalizing object
   - Moved singleton logic from GObject constructor to `gstd_session_new()`
 
+- **Bug: No-arg actions broken in parser** (`gstd_parser.c`)
+  - `action_emit` passed unvalidated NULL `tokens[3]` to URI builder
+  - Actions without arguments now work correctly
+
+- **Memory leak: soup_message_body_flatten buffer not freed** (`gstd_http.c`)
+  - `parse_json_body()` leaked the SoupBuffer/GBytes returned by flatten
+  - Now properly frees buffer on all exit paths for both libsoup 2.x and 3.x
+
+- **Bug: GValue unset on uninitialized values** (`gstd_action.c`)
+  - Cleanup loop could call `g_value_unset()` on uninitialized GValues
+  - Now tracks actual initialized count to prevent GLib criticals
+
+- **Bug: Extra action arguments silently merged** (`gstd_action.c`)
+  - `g_strsplit(..., query.n_params)` hid extra arguments in last token
+  - Now splits with no limit and properly validates argument count
+
+- **Memory leak: g_inet_address_to_string not freed** (`gstd_socket.c`)
+  - Address string leaked on each client connection
+  - Now properly freed after use
+
 ### Tests
 - Added `test_gstd_refcount.c` with new thread safety tests:
   - `test_concurrent_state_changes` - Tests state changes from multiple threads

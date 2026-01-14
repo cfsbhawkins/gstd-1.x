@@ -944,8 +944,15 @@ gstd_parser_action_emit (GstdSession * session, gchar * action,
   check_argument (tokens[1], GSTD_BAD_COMMAND);
   check_argument (tokens[2], GSTD_BAD_COMMAND);
 
-  uri = g_strdup_printf ("/pipelines/%s/elements/%s/actions/%s %s %s",
-      tokens[0], tokens[1], tokens[2], tokens[2], tokens[3]);
+  /* tokens[3] may be NULL for no-arg actions */
+  if (tokens[3] && tokens[3][0] != '\0') {
+    uri = g_strdup_printf ("/pipelines/%s/elements/%s/actions/%s %s %s",
+        tokens[0], tokens[1], tokens[2], tokens[2], tokens[3]);
+  } else {
+    /* No-arg action: omit the description argument */
+    uri = g_strdup_printf ("/pipelines/%s/elements/%s/actions/%s %s",
+        tokens[0], tokens[1], tokens[2], tokens[2]);
+  }
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "create", uri, response);
 
   g_free (uri);
