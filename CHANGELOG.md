@@ -39,6 +39,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `g_value_unset()` before early return in `gstd_state_update()`
   - Prevents leak when state deserialization fails
 
+- **Critical: Session singleton race condition** (`gstd_session.c`)
+  - Replaced weak pointer with `GWeakRef` for thread-safe singleton pattern
+  - Fixed race where `g_object_ref()` could be called on finalizing object
+  - Moved singleton logic from GObject constructor to `gstd_session_new()`
+
+### Tests
+- Added `test_gstd_refcount.c` with new thread safety tests:
+  - `test_concurrent_state_changes` - Tests state changes from multiple threads
+  - `test_invalid_state_no_leak` - Tests GValue cleanup on invalid state
+  - `test_pipeline_refcount_balance` - Tests play/stop refcount cycles
+  - `test_session_singleton` - Tests singleton pattern behavior
+  - `test_concurrent_session_access` - Tests concurrent session creation/destruction
+
+- Added `test_gstd_parser.c` with command parser tests (17 tests):
+  - Pipeline lifecycle: `pipeline_create`, `pipeline_delete`, `pipeline_play`, `pipeline_pause`, `pipeline_stop`
+  - Query commands: `list_pipelines`, `read`, `list_elements`
+  - Element property: `element_get`, `element_set`
+  - Events: `event_eos`
+  - Error handling: Invalid commands, NULL commands, invalid pipeline descriptions, missing arguments
+
 ## [0.16.0] - 2026-01-14
 
 ### Added
