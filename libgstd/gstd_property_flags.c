@@ -88,5 +88,7 @@ gstd_property_flags_update (GstdObject * object, const gchar * svalue)
     ret = GSTD_EOK;
   }
 
+  g_value_unset (&value);
+
   return ret;
 }
