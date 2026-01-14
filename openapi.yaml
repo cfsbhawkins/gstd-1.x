@@ -82,6 +82,40 @@ paths:
                 response:
                   status: unhealthy
 
+  /pipelines/status:
+    get:
+      tags:
+        - Health
+      summary: Get pipeline status (fast path)
+      description: |
+        Lightweight endpoint for monitoring pipeline states. This endpoint bypasses
+        the thread pool and returns only essential status information, making it
+        ideal for frequent polling by monitoring systems.
+
+        Unlike `/pipelines` which returns full pipeline details through the thread pool,
+        this endpoint is optimized for high-frequency status checks without causing
+        server lockups under load.
+
+        **Note:** This endpoint is custom to this fork and not available in upstream gstd.
+      operationId: getPipelinesStatus
+      responses:
+        '200':
+          description: Pipeline status list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineStatusResponse'
+              example:
+                code: 0
+                description: OK
+                response:
+                  pipelines:
+                    - name: mypipeline
+                      state: PLAYING
+                    - name: backup_pipeline
+                      state: PAUSED
+                  count: 2
+
   /pipelines:
     get:
       tags:
@@ -981,6 +1015,34 @@ components:
                   type: string
                   enum:
                     - unhealthy
+
+    PipelineStatusResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                pipelines:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                        description: Pipeline name
+                      state:
+                        type: string
+                        enum:
+                          - NULL
+                          - READY
+                          - PAUSED
+                          - PLAYING
+                        description: Current pipeline state
+                count:
+                  type: integer
+                  description: Total number of pipelines
 
     CreatePipelineRequest:
       type: object

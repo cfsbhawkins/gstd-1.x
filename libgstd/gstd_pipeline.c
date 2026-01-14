@@ -262,17 +262,26 @@ gstd_pipeline_build (GstdPipeline * object)
 
   self->event_handler = gstd_event_handler_new (G_OBJECT (self->pipeline));
   if (!self->event_handler) {
+    GST_ERROR_OBJECT (self, "Failed to create event handler");
     ret = GSTD_BAD_VALUE;
     goto out1;
   }
 
-  self->pipeline_bus =
-      gstd_pipeline_bus_new (gst_pipeline_get_bus (GST_PIPELINE
-          (self->pipeline)));
-
-  if (!self->pipeline_bus) {
-    ret = GSTD_BAD_VALUE;
-    goto out2;
+  {
+    GstBus *bus = gst_pipeline_get_bus (GST_PIPELINE (self->pipeline));
+    if (!bus) {
+      GST_ERROR_OBJECT (self, "Failed to get pipeline bus");
+      ret = GSTD_BAD_VALUE;
+      goto out2;
+    }
+    self->pipeline_bus = gstd_pipeline_bus_new (bus);
+    if (!self->pipeline_bus) {
+      GST_ERROR_OBJECT (self, "Failed to create pipeline bus wrapper");
+      gst_object_unref (bus);
+      ret = GSTD_BAD_VALUE;
+      goto out2;
+    }
+    /* pipeline_bus now owns the bus reference */
   }
 
   goto out;
@@ -284,7 +293,7 @@ out2:
 out1:
   g_object_unref (self->elements);
   self->elements = NULL;
-  g_object_unref (self->pipeline);
+  gst_object_unref (self->pipeline);
   self->pipeline = NULL;
 
 out:
@@ -331,7 +340,7 @@ gstd_pipeline_dispose (GObject * object)
   }
 
   if (self->graph) {
-    g_object_unref (self->graph);
+    g_free (self->graph);
     self->graph = NULL;
   }
   G_OBJECT_CLASS (gstd_pipeline_parent_class)->dispose (object);
@@ -543,6 +552,9 @@ wrong_pipeline:
   }
 }
 
+/* Maximum number of iterator resyncs before giving up */
+#define GSTD_MAX_ITERATOR_RESYNC 10
+
 static GstdReturnCode
 gstd_pipeline_fill_elements (GstdPipeline * self, GstElement * element)
 {
@@ -552,6 +564,7 @@ gstd_pipeline_fill_elements (GstdPipeline * self, GstElement * element)
   GstElement *gste;
   gboolean done;
   GstdElement *gstd_element;
+  gint resync_count = 0;
 
   g_return_val_if_fail (GSTD_IS_PIPELINE (self), GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (GST_IS_ELEMENT (element), GSTD_NULL_ARGUMENT);
@@ -580,8 +593,20 @@ gstd_pipeline_fill_elements (GstdPipeline * self, GstElement * element)
         gstd_list_append_child (self->elements, GSTD_OBJECT (gstd_element));
 
         g_value_reset (&item);
+        /* Reset resync count on successful iteration */
+        resync_count = 0;
         break;
       case GST_ITERATOR_RESYNC:
+        resync_count++;
+        if (resync_count > GSTD_MAX_ITERATOR_RESYNC) {
+          GST_WARNING_OBJECT (self,
+              "Too many iterator resyncs (%d), pipeline may be unstable",
+              resync_count);
+          done = TRUE;
+          break;
+        }
+        GST_DEBUG_OBJECT (self, "Iterator resync %d/%d",
+            resync_count, GSTD_MAX_ITERATOR_RESYNC);
         gst_iterator_resync (it);
         break;
       case GST_ITERATOR_ERROR:

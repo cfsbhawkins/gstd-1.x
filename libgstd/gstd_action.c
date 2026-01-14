@@ -226,11 +226,18 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
 
   if (query.n_params > 0 && (!description || g_strcmp0(description, "(null)") == 0 || g_strcmp0(description, "") == 0)) {
     return GSTD_NULL_ARGUMENT;
-  } else if (description) {
+  }
+
+  if (description) {
     arg_list = g_strsplit (description, " ", query.n_params);
   }
 
-  if (g_strv_length (arg_list) != query.n_params) {
+  if (arg_list && g_strv_length (arg_list) != query.n_params) {
+    g_strfreev (arg_list);
+    return GSTD_NULL_ARGUMENT;
+  }
+
+  if (!arg_list && query.n_params > 0) {
     return GSTD_NULL_ARGUMENT;
   }
 
