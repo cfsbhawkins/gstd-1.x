@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `g_object_unref()` for previous value before setting new pipelines/debug objects
   - Prevents leak when properties are set multiple times
 
+- **Memory leak: GValue not unset on error path** (`gstd_state.c`)
+  - Added `g_value_unset()` before early return in `gstd_state_update()`
+  - Prevents leak when state deserialization fails
+
 ## [0.16.0] - 2026-01-14
 
 ### Added
