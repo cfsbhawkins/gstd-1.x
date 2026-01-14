@@ -65,5 +65,14 @@ GstdReturnCode gstd_pipeline_increment_refcount (GstdPipeline * self);
  **/
 GstdReturnCode gstd_pipeline_decrement_refcount (GstdPipeline * self);
 
+/**
+ * Get the underlying GstElement pipeline
+ *
+ * \param self GstdPipeline object
+ *
+ * \return The GstElement pipeline, or NULL if not built. Does not add a reference.
+ **/
+GstElement *gstd_pipeline_get_element (GstdPipeline * self);
+
 G_END_DECLS
 #endif // __GSTD_PIPELINE_H__

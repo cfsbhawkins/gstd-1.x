@@ -57,34 +57,10 @@ gstd_session_set_property (GObject *, guint, const GValue *, GParamSpec *);
 static void gstd_session_get_property (GObject *, guint, GValue *,
     GParamSpec *);
 static void gstd_session_dispose (GObject *);
-static GObject *gstd_session_constructor (GType, guint,
-    GObjectConstructParam *);
 
-
-static GObject *
-gstd_session_constructor (GType type,
-    guint n_construct_params, GObjectConstructParam * construct_params)
-{
-  static GObject *the_session = NULL;
-  GObject *object = NULL;
-  g_mutex_lock (&singleton_mutex);
-
-  if (the_session == NULL) {
-    object =
-        G_OBJECT_CLASS (gstd_session_parent_class)->constructor (type,
-        n_construct_params, construct_params);
-    the_session = object;
-
-    /* NULL out the_session when no references remain, to ensure a new
-       session is created in the next constuctor */
-    g_object_add_weak_pointer (the_session, (gpointer) & the_session);
-  } else {
-    object = g_object_ref (G_OBJECT (the_session));
-  }
-  g_mutex_unlock (&singleton_mutex);
-
-  return object;
-}
+/* Singleton instance using thread-safe weak reference */
+static GWeakRef the_session_ref;
+static gboolean the_session_ref_initialized = FALSE;
 
 static void
 gstd_session_class_init (GstdSessionClass * klass)
@@ -96,7 +72,6 @@ gstd_session_class_init (GstdSessionClass * klass)
   object_class->set_property = gstd_session_set_property;
   object_class->get_property = gstd_session_get_property;
   object_class->dispose = gstd_session_dispose;
-  object_class->constructor = gstd_session_constructor;
 
   properties[PROP_PIPELINES] =
       g_param_spec_object ("pipelines",
@@ -192,10 +167,16 @@ gstd_session_set_property (GObject * object,
 
   switch (property_id) {
     case PROP_PIPELINES:
+      if (self->pipelines) {
+        g_object_unref (self->pipelines);
+      }
       self->pipelines = g_value_dup_object (value);
       GST_INFO_OBJECT (self, "Changed pipeline list to %p", self->pipelines);
       break;
     case PROP_DEBUG:
+      if (self->debug) {
+        g_object_unref (self->debug);
+      }
       self->debug = g_value_dup_object (value);
       GST_DEBUG_OBJECT (self, "Changing debug object to %p", self->debug);
       break;
@@ -230,16 +211,37 @@ gstd_session_dispose (GObject * object)
 GstdSession *
 gstd_session_new (const gchar * name)
 {
-  GstdSession *self;
-  if (!name) {
-    GPid tempPid = (GPid) getpid ();
-    gchar *pid_name = g_strdup_printf ("Session %d", tempPid);
-    self =
-        GSTD_SESSION (g_object_new (GSTD_TYPE_SESSION, "name", pid_name, NULL));
-    g_free (pid_name);
-  } else {
-    self = GSTD_SESSION (g_object_new (GSTD_TYPE_SESSION, "name", name, NULL));
+  GstdSession *self = NULL;
+
+  g_mutex_lock (&singleton_mutex);
+
+  /* Initialize weak ref on first call */
+  if (!the_session_ref_initialized) {
+    g_weak_ref_init (&the_session_ref, NULL);
+    the_session_ref_initialized = TRUE;
   }
+
+  /* Try to get existing session - g_weak_ref_get is atomic and thread-safe */
+  self = g_weak_ref_get (&the_session_ref);
+
+  if (self == NULL) {
+    /* Create new session */
+    if (!name) {
+      GPid tempPid = (GPid) getpid ();
+      gchar *pid_name = g_strdup_printf ("Session %d", tempPid);
+      self =
+          GSTD_SESSION (g_object_new (GSTD_TYPE_SESSION, "name", pid_name, NULL));
+      g_free (pid_name);
+    } else {
+      self = GSTD_SESSION (g_object_new (GSTD_TYPE_SESSION, "name", name, NULL));
+    }
+    /* Store in weak ref - automatically cleared when object is finalized */
+    g_weak_ref_set (&the_session_ref, self);
+  }
+  /* Note: g_weak_ref_get already added a ref, so we don't need to ref again */
+
+  g_mutex_unlock (&singleton_mutex);
+
   return self;
 }
 

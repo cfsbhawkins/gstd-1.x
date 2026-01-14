@@ -30,7 +30,8 @@ G_BEGIN_DECLS
 #define GSTD_TCP_DEFAULT_ADDRESS "127.0.0.1"
 #define GSTD_TCP_DEFAULT_PORT 5000
 #define GSTD_TCP_DEFAULT_NUM_PORTS 1
-#define GSTD_TCP_DEFAULT_MAX_THREADS -1
+/* Default to 16 threads. Use -1 for unlimited (not recommended for production) */
+#define GSTD_TCP_DEFAULT_MAX_THREADS 16
 
 #define GSTD_TYPE_TCP \
   (gstd_tcp_get_type())

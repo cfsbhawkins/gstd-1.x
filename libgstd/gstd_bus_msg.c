@@ -119,6 +119,8 @@ gstd_bus_msg_factory_make (GstMessage * target)
       break;
 #endif
     default:
+      GST_DEBUG ("Unhandled bus message type: %s (%d)",
+          GST_MESSAGE_TYPE_NAME (target), type);
       msg = g_object_new (GSTD_TYPE_BUS_MSG, NULL);
       break;
   }

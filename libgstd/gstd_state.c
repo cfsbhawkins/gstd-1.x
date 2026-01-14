@@ -230,13 +230,24 @@ gstd_state_update (GstdObject * object, const gchar * sstate)
   g_value_init (&value, GSTD_TYPE_STATE_ENUM);
   if (!gst_value_deserialize (&value, sstate)) {
     GST_ERROR_OBJECT (self, "Unable to interpret \"%s\" as a state", sstate);
+    g_value_unset (&value);
     return GSTD_BAD_VALUE;
   }
 
   state = g_value_get_enum (&value);
   g_value_unset (&value);
 
+  GST_INFO_OBJECT (self, "Setting pipeline state to %s",
+      gst_element_state_get_name (state));
+
   gstret = gst_element_set_state (self->target, state);
+
+  if (GST_STATE_CHANGE_ASYNC == gstret) {
+    GST_INFO_OBJECT (self, "State change to %s is async (will complete later)",
+        gst_element_state_get_name (state));
+    /* Async is OK - state change is in progress */
+  }
+
   if (GST_STATE_CHANGE_FAILURE == gstret) {
     GstBus *bus;
     GstMessage *msg;
@@ -250,8 +261,14 @@ gstd_state_update (GstdObject * object, const gchar * sstate)
         GError *err = NULL;
         gchar *debug = NULL;
         gst_message_parse_error (msg, &err, &debug);
-        g_printerr ("gstd: State change failed: %s\n", err->message);
-        g_error_free (err);
+        if (err) {
+          g_printerr ("gstd: State change failed: %s\n", err->message);
+          GST_ERROR_OBJECT (self, "State change failed: %s (debug: %s)",
+              err->message, debug ? debug : "none");
+          g_error_free (err);
+        } else {
+          g_printerr ("gstd: State change failed (failed to parse error)\n");
+        }
         g_free (debug);
         gst_message_unref (msg);
       } else {
@@ -296,15 +313,28 @@ gstd_state_dispose (GObject * object)
   G_OBJECT_CLASS (gstd_state_parent_class)->dispose (object);
 }
 
+/* Timeout for state queries - 100ms is reasonable for status polling */
+#define GSTD_STATE_QUERY_TIMEOUT (100 * GST_MSECOND)
+
 static GstState
 gstd_state_read (GstdState * self)
 {
   GstState current;
   GstState pending;
+  GstStateChangeReturn ret;
 
   g_return_val_if_fail (self, GST_STATE_NULL);
 
-  gst_element_get_state (self->target, &current, &pending, 0);
+  ret = gst_element_get_state (self->target, &current, &pending,
+      GSTD_STATE_QUERY_TIMEOUT);
+
+  if (ret == GST_STATE_CHANGE_ASYNC) {
+    GST_DEBUG_OBJECT (self, "State change still pending, current=%s pending=%s",
+        gst_element_state_get_name (current),
+        gst_element_state_get_name (pending));
+  } else if (ret == GST_STATE_CHANGE_FAILURE) {
+    GST_WARNING_OBJECT (self, "Failed to get pipeline state");
+  }
 
   return current;
 }
@@ -313,7 +343,9 @@ GstdReturnCode
 gstd_state_increment_refcount (GstdState * self)
 {
   g_return_val_if_fail (self, GSTD_NULL_ARGUMENT);
+  GST_OBJECT_LOCK (self);
   self->refcount++;
+  GST_OBJECT_UNLOCK (self);
   return GSTD_EOK;
 }
 
@@ -321,8 +353,10 @@ GstdReturnCode
 gstd_state_decrement_refcount (GstdState * self)
 {
   g_return_val_if_fail (self, GSTD_NULL_ARGUMENT);
+  GST_OBJECT_LOCK (self);
   if (0 < self->refcount) {
     self->refcount--;
   }
+  GST_OBJECT_UNLOCK (self);
   return GSTD_EOK;
 }

@@ -196,10 +196,18 @@ gstd_start (GstD * gstd)
 
   /* Run start for each IPC (each start method checks for the enabled flag) */
   for (ipc_idx = 0; ipc_idx < gstd->num_ipcs; ipc_idx++) {
-    code = gstd_ipc_start (gstd->ipc_array[ipc_idx], gstd->session);
+    GstdIpc *ipc = gstd->ipc_array[ipc_idx];
+    gboolean enabled = FALSE;
+
+    g_object_get (G_OBJECT (ipc), "enabled", &enabled, NULL);
+    if (!enabled) {
+      continue;
+    }
+
+    code = gstd_ipc_start (ipc, gstd->session);
     if (code) {
-      g_printerr ("Couldn't start IPC : (%s)\n",
-          G_OBJECT_TYPE_NAME (gstd->ipc_array[ipc_idx]));
+      g_printerr ("gstd: Failed to start %s (error: %s)\n",
+          G_OBJECT_TYPE_NAME (ipc), gstd_return_code_to_string (code));
       ret = FALSE;
     }
   }
