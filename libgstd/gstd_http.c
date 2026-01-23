@@ -591,10 +591,14 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
 
     name = GSTD_OBJECT_NAME (pipeline);
 
-    /* Get current pipeline state directly from GStreamer */
+    /* Get current pipeline state directly from GStreamer.
+     * Must ref the element to prevent use-after-free if pipeline
+     * is deleted by another thread while we're querying state. */
     GstElement *element = gstd_pipeline_get_element (pipeline);
     if (element) {
+      gst_object_ref (element);
       gst_element_get_state (element, &current_state, NULL, 0);
+      gst_object_unref (element);
     }
 
     if (!first) {

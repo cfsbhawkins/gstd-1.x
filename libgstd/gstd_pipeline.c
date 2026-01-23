@@ -378,10 +378,17 @@ gstd_pipeline_get_property (GObject * object,
       break;
     case PROP_GRAPH:
       GST_DEBUG_OBJECT (self, "Returning graph handler %p", self->graph);
-      dot = gst_debug_bin_to_dot_data (GST_BIN (self->pipeline),
-          GST_DEBUG_GRAPH_SHOW_ALL);
-      g_value_set_string (value, dot);
-      g_free (dot);
+      /* Ref pipeline to prevent use-after-free if deleted by another thread */
+      if (self->pipeline) {
+        GstElement *pipe = gst_object_ref (self->pipeline);
+        dot = gst_debug_bin_to_dot_data (GST_BIN (pipe),
+            GST_DEBUG_GRAPH_SHOW_ALL);
+        gst_object_unref (pipe);
+        g_value_set_string (value, dot);
+        g_free (dot);
+      } else {
+        g_value_set_string (value, NULL);
+      }
       break;
 
     case PROP_VERBOSE:
@@ -398,9 +405,16 @@ gstd_pipeline_get_property (GObject * object,
       break;
 
     case PROP_POSITION:
-      if (!gst_element_query_position (self->pipeline, GST_FORMAT_TIME,
-              &self->position)) {
-        /* if the query could not be performed. return 0 */
+      /* Ref pipeline to prevent use-after-free if deleted by another thread */
+      if (self->pipeline) {
+        GstElement *pipe = gst_object_ref (self->pipeline);
+        if (!gst_element_query_position (pipe, GST_FORMAT_TIME,
+                &self->position)) {
+          /* if the query could not be performed. return 0 */
+          self->position = G_GINT64_CONSTANT (0);
+        }
+        gst_object_unref (pipe);
+      } else {
         self->position = G_GINT64_CONSTANT (0);
       }
 
@@ -409,9 +423,16 @@ gstd_pipeline_get_property (GObject * object,
       g_value_set_int64 (value, self->position);
       break;
     case PROP_DURATION:
-      if (!gst_element_query_duration (self->pipeline, GST_FORMAT_TIME,
-              &self->duration)) {
-        /* if the query could not be performed. return 0 */
+      /* Ref pipeline to prevent use-after-free if deleted by another thread */
+      if (self->pipeline) {
+        GstElement *pipe = gst_object_ref (self->pipeline);
+        if (!gst_element_query_duration (pipe, GST_FORMAT_TIME,
+                &self->duration)) {
+          /* if the query could not be performed. return 0 */
+          self->duration = G_GINT64_CONSTANT (0);
+        }
+        gst_object_unref (pipe);
+      } else {
         self->duration = G_GINT64_CONSTANT (0);
       }
 

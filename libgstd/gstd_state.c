@@ -126,8 +126,10 @@ gstd_state_get_property (GObject * object,
 
   switch (property_id) {
     case PROP_REFCOUNT:
+      GST_OBJECT_LOCK (self);
       GST_DEBUG_OBJECT (self, "Returning refcount %u", self->refcount);
       g_value_set_int (value, self->refcount);
+      GST_OBJECT_UNLOCK (self);
       break;
 
     default:
