@@ -157,7 +157,8 @@ gstd_list_reader_read_child (GstdIReader * iface,
 
   found = gstd_list_find_child (GSTD_LIST (object), name);
   if (found) {
-    *out = GSTD_OBJECT (g_object_ref (found));
+    /* gstd_list_find_child now returns a ref'd pointer, no need to ref again */
+    *out = GSTD_OBJECT (found);
     ret = GSTD_EOK;
   } else {
     *out = NULL;

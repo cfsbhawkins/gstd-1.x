@@ -218,8 +218,8 @@ gstd_list_create (GstdObject * object, const gchar * name,
     goto error;
   }
 
-  self->count++;
-
+  /* Note: gstd_list_append_child updates count inside its lock,
+   * so we don't increment count here to avoid race condition */
   if (!gstd_list_append_child (self, out)) {
     g_object_unref (out);
     ret = GSTD_EXISTING_RESOURCE;
@@ -308,8 +308,11 @@ gstd_list_to_string (GstdObject * object, gchar ** outstring)
   // A little hack to remove the last bracket
   props[strlen (props) - 2] = '\0';
 
-  list = self->list;
   acc = g_strdup ("");
+
+  /* Lock while iterating the list to prevent concurrent modification */
+  GST_OBJECT_LOCK (self);
+  list = self->list;
   while (list) {
     separator = list->next ? "," : "";
     node =
@@ -319,6 +322,7 @@ gstd_list_to_string (GstdObject * object, gchar ** outstring)
     acc = node;
     list = list->next;
   }
+  GST_OBJECT_UNLOCK (self);
 
   *outstring = g_strdup_printf ("%s,\n  \"nodes\" : [%s]\n}", props, acc);
   g_free (props);
@@ -339,9 +343,11 @@ gstd_list_find_child (GstdList * self, const gchar * name)
   GST_OBJECT_LOCK (self);
   result = g_list_find_custom (self->list, name, gstd_list_find_node);
 
-
   if (result) {
     child = GSTD_OBJECT (result->data);
+    /* Ref the child before returning to prevent use-after-free
+     * if another thread deletes it after we unlock. Caller must unref. */
+    g_object_ref (child);
   } else {
     child = NULL;
   }
