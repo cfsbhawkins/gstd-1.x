@@ -1,0 +1,61 @@
+name: Security
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [develop]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday scan
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libedit-dev \
+            libdaemon-dev libjansson-dev ninja-build meson
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+
+      - name: Build
+        run: |
+          meson setup build
+          ninja -C build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  sanitizers:
+    name: AddressSanitizer Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libedit-dev \
+            libdaemon-dev libjansson-dev ninja-build meson
+
+      - name: Build with ASan
+        run: |
+          meson setup build -Db_sanitize=address
+          ninja -C build
+
+      - name: Run tests with ASan
+        run: ninja -C build test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
