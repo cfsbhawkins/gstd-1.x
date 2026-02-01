@@ -201,6 +201,7 @@ clear_mem:
     free ((*out)[j]);
   }
   free (*out);
+  json_decref (root);
   return ret;
 
 }

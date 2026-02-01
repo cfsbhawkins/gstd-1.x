@@ -128,6 +128,7 @@ GST_START_TEST (test_pipeline_get_graph_success)
   assert_equals_int (GSTC_OK, ret);
 
   assert_equals_string (expected, _request);
+  free (pipe_description);
 }
 
 GST_END_TEST;

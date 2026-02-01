@@ -164,6 +164,7 @@ GST_START_TEST (test_json_child_char_success)
     { \"string\" : \"result2\" },{ \"string\" : \"result3\" }] } } ";
   int list_lenght;
   char **result;
+  int i;
 
   ret = gstc_json_get_child_char_array (json, "parent", "array",
       "string", &result, &list_lenght);
@@ -174,6 +175,11 @@ GST_START_TEST (test_json_child_char_success)
   assert_equals_string (result[0], "result1");
   assert_equals_string (result[1], "result2");
   assert_equals_string (result[2], "result3");
+
+  for (i = 0; i < list_lenght; i++) {
+    free (result[i]);
+  }
+  free (result);
 }
 
 GST_END_TEST;
@@ -187,6 +193,7 @@ GST_START_TEST (test_json_child_string_sucess)
   ret = gstc_json_child_string (json, "parent", "value_name", &out);
 
   assert_equals_int (GSTC_OK, ret);
+  free (out);
 }
 
 GST_END_TEST;
@@ -203,6 +210,7 @@ GST_START_TEST (test_json_child_char_empty_array)
 
   assert_equals_int (GSTC_OK, ret);
   assert_equals_int (0, list_lenght);
+  free (result);
 }
 
 GST_END_TEST;
