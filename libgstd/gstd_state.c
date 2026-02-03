@@ -242,6 +242,11 @@ gstd_state_update (GstdObject * object, const gchar * sstate)
   GST_INFO_OBJECT (self, "Setting pipeline state to %s",
       gst_element_state_get_name (state));
 
+  if (!self->target) {
+    GST_ERROR_OBJECT (self, "Target pipeline is NULL, cannot change state");
+    return GSTD_NULL_ARGUMENT;
+  }
+
   gstret = gst_element_set_state (self->target, state);
 
   if (GST_STATE_CHANGE_ASYNC == gstret) {
@@ -309,8 +314,10 @@ gstd_state_dispose (GObject * object)
 
   self = GSTD_STATE (object);
 
-  gst_object_unref (self->target);
-  self->target = NULL;
+  if (self->target) {
+    gst_object_unref (self->target);
+    self->target = NULL;
+  }
 
   G_OBJECT_CLASS (gstd_state_parent_class)->dispose (object);
 }
@@ -326,6 +333,7 @@ gstd_state_read (GstdState * self)
   GstStateChangeReturn ret;
 
   g_return_val_if_fail (self, GST_STATE_NULL);
+  g_return_val_if_fail (self->target, GST_STATE_NULL);
 
   ret = gst_element_get_state (self->target, &current, &pending,
       GSTD_STATE_QUERY_TIMEOUT);
