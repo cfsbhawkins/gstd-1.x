@@ -561,6 +561,7 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
   GString *json;
   GList *pipelines;
   GList *iter;
+  guint count;
   gboolean first = TRUE;
   SoupMessageHeaders *response_headers = NULL;
 
@@ -580,9 +581,19 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
   json = g_string_new ("{\n  \"code\" : 0,\n  \"description\" : \"OK\",\n");
   g_string_append (json, "  \"response\" : {\n    \"pipelines\": [");
 
-  /* Lock the list while iterating to prevent concurrent modification */
+  /* Snapshot the pipeline list under the lock, then release the lock
+   * before querying states. gst_element_get_state() can block if a
+   * state change is in progress (it needs the element's state lock),
+   * so holding the list lock during state queries can deadlock the
+   * entire pipeline list — blocking create/delete/play on all pipelines. */
   GST_OBJECT_LOCK (session->pipelines);
-  pipelines = session->pipelines->list;
+  pipelines = g_list_copy (session->pipelines->list);
+  count = session->pipelines->count;
+  /* Ref each pipeline to prevent use-after-free after releasing the lock */
+  for (iter = pipelines; iter != NULL; iter = g_list_next (iter)) {
+    gst_object_ref (iter->data);
+  }
+  GST_OBJECT_UNLOCK (session->pipelines);
 
   for (iter = pipelines; iter != NULL; iter = g_list_next (iter)) {
     GstdPipeline *pipeline = GSTD_PIPELINE (iter->data);
@@ -591,13 +602,16 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
 
     name = GSTD_OBJECT_NAME (pipeline);
 
-    /* Get current pipeline state directly from GStreamer.
-     * Must ref the element to prevent use-after-free if pipeline
-     * is deleted by another thread while we're querying state. */
+    /* Read the cached state without blocking.
+     * gst_element_get_state() acquires the element's state lock, which
+     * blocks if gst_element_set_state() is in progress on another thread.
+     * Since this endpoint runs on the soup main thread, any blocking here
+     * stalls all HTTP I/O. Use GST_STATE() for a lock-free read of the
+     * last-known state instead. */
     GstElement *element = gstd_pipeline_get_element (pipeline);
     if (element) {
       gst_object_ref (element);
-      gst_element_get_state (element, &current_state, NULL, 0);
+      current_state = GST_STATE (element);
       gst_object_unref (element);
     }
 
@@ -610,12 +624,14 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
         "\n      {\"name\": \"%s\", \"state\": \"%s\"}",
         name,
         gst_element_state_get_name (current_state));
+
+    gst_object_unref (pipeline);
   }
 
-  GST_OBJECT_UNLOCK (session->pipelines);
+  g_list_free (pipelines);
 
   g_string_append (json, "\n    ],\n    \"count\": ");
-  g_string_append_printf (json, "%u", session->pipelines->count);
+  g_string_append_printf (json, "%u", count);
   g_string_append (json, "\n  }\n}");
 
 #if SOUP_CHECK_VERSION(3,0,0)
