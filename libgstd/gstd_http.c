@@ -29,6 +29,7 @@
 #include <json-glib/json-glib.h>
 
 #include "gstd_http.h"
+#include "gstd_list.h"
 #include "gstd_parser.h"
 #include "gstd_pipeline.h"
 #include "gstd_session.h"
@@ -647,6 +648,323 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
   g_string_free (json, TRUE);
 }
 
+/*
+ * Escape a string for safe embedding inside a JSON quoted value.
+ * Handles double-quote and backslash which would break JSON structure.
+ * Caller must g_free() the result.
+ */
+static gchar *
+json_escape_string (const gchar * s)
+{
+  GString *out = g_string_new (NULL);
+  for (; *s; s++) {
+    if (*s == '"' || *s == '\\')
+      g_string_append_c (out, '\\');
+    g_string_append_c (out, *s);
+  }
+  return g_string_free (out, FALSE);
+}
+
+/**
+ * handle_clock_sync:
+ * @server: the SoupServer handling the request
+ * @msg: the HTTP message to respond to
+ * @query: query parameters (requires "source" and "targets")
+ * @session: the GstD session containing the pipeline list
+ *
+ * Fast-path handler for inter-pipeline clock synchronization (one-to-many).
+ *
+ * Copies the GstClock reference and base_time from a single source pipeline
+ * to one or more target pipelines. This is required by the rsinter plugin
+ * (intersink/intersrc) when consumer pipelines are rebuilt while the
+ * producer keeps running.
+ *
+ * Without clock synchronization, rebuilt consumer pipelines get a default
+ * base_time that doesn't match the producer's time domain, causing buffers
+ * to appear far in the future. The sink then waits indefinitely, producing
+ * frozen or extremely slow video.
+ *
+ * Multiple targets are specified as a comma-separated list. This allows a
+ * single HTTP call to synchronize all consumer pipelines (output, preview,
+ * framegrab, KLV, etc.) that share the same ingest pipeline.
+ *
+ * Targets that are not found are skipped (logged as warnings) rather than
+ * failing the entire request. This is intentional — during pipeline rebuild,
+ * some consumer pipelines may not exist yet or may have already been deleted.
+ *
+ * This runs on the soup main thread (fast-path, bypasses thread pool) for
+ * minimal latency. The underlying operations (set_clock, set_base_time)
+ * are lightweight pointer/value stores, but do acquire element object locks
+ * briefly — acceptable for the typical target count (< 10).
+ *
+ * Reference: https://gstreamer.freedesktop.org/documentation/rsinter/intersrc.html
+ *
+ * HTTP: POST /pipelines/clock_sync?source=<pipeline>&targets=<pipeline>[,<pipeline>,...]
+ *
+ * Response (200): { "code": 0, "description": "Success",
+ *                   "response": { "base_time": <uint64>,
+ *                                 "synced": ["p1","p2"],
+ *                                 "skipped": ["p3"] } }
+ * Error (400): Missing or invalid query parameters
+ * Error (404): Source pipeline not found
+ * Error (405): Wrong HTTP method (only POST allowed)
+ * Error (500): Source pipeline element not available
+ *
+ * Note: This endpoint is custom to this fork and not available in upstream gstd.
+ */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+handle_clock_sync (SoupServer * server, SoupMsg * msg,
+    GHashTable * query, GstdSession * session)
+#else
+handle_clock_sync (SoupServer * server, SoupMessage * msg,
+    GHashTable * query, GstdSession * session)
+#endif
+{
+  const gchar *source_name = NULL;
+  const gchar *targets_csv = NULL;
+  GstdObject *source_obj = NULL;
+  GstElement *source_elem = NULL;
+  GstClock *clock = NULL;
+  GstClockTime base_time;
+  gchar **target_names = NULL;
+  const gchar *error_json = NULL;
+  const gchar *method = NULL;
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Origin", "*");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Headers", "origin,range,content-type");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Methods", "POST");
+
+  /* Allow CORS preflight through, reject non-POST for actual requests */
+#if SOUP_CHECK_VERSION(3,0,0)
+  method = soup_server_message_get_method (msg);
+#else
+  method = msg->method;
+#endif
+  if (method == SOUP_METHOD_OPTIONS) {
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+    soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+    return;
+  }
+  if (method != SOUP_METHOD_POST) {
+    error_json =
+        "{ \"code\": 1, \"description\": \"Method not allowed:"
+        " use POST\", \"response\": null }";
+    goto error_405;
+  }
+
+  /* Validate query parameters */
+  if (!query) {
+    error_json =
+        "{ \"code\": 1, \"description\": \"Missing query parameters:"
+        " source and targets\", \"response\": null }";
+    goto error_400;
+  }
+
+  source_name = g_hash_table_lookup (query, "source");
+  targets_csv = g_hash_table_lookup (query, "targets");
+
+  if (!source_name || !targets_csv || targets_csv[0] == '\0') {
+    error_json =
+        "{ \"code\": 1, \"description\": \"Required query parameters:"
+        " source=<pipeline> and targets=<pipeline>[,<pipeline>,...]\","
+        " \"response\": null }";
+    goto error_400;
+  }
+
+  /* Find source pipeline */
+  source_obj = gstd_list_find_child (session->pipelines, source_name);
+  if (!source_obj) {
+    error_json =
+        "{ \"code\": 4, \"description\": \"Source pipeline not found\","
+        " \"response\": null }";
+    goto error_404;
+  }
+
+  /* Get underlying GstElement for the source pipeline.
+   * gstd_pipeline_get_element returns a borrowed pointer (no ref added),
+   * so ref it to prevent use-after-free if the pipeline is modified
+   * concurrently. */
+  source_elem = gstd_pipeline_get_element (GSTD_PIPELINE (source_obj));
+  if (!source_elem) {
+    g_object_unref (source_obj);
+    error_json =
+        "{ \"code\": 5, \"description\": \"Source pipeline element"
+        " not available\", \"response\": null }";
+    goto error_500;
+  }
+  gst_object_ref (source_elem);
+
+  /* Read clock and base_time from source (once) */
+  clock = gst_element_get_clock (source_elem);
+  base_time = gst_element_get_base_time (source_elem);
+
+  gst_object_unref (source_elem);
+
+  /* Apply clock and base_time to each target pipeline */
+  target_names = g_strsplit (targets_csv, ",", -1);
+
+  {
+    GString *synced_json = g_string_new ("[");
+    GString *skipped_json = g_string_new ("[");
+    gboolean first_synced = TRUE;
+    gboolean first_skipped = TRUE;
+    guint i;
+
+    for (i = 0; target_names[i] != NULL; i++) {
+      const gchar *name = g_strstrip (target_names[i]);
+      GstdObject *target_obj;
+      GstElement *target_elem;
+      gchar *escaped;
+
+      if (name[0] == '\0')
+        continue;
+
+      target_obj = gstd_list_find_child (session->pipelines, name);
+      if (!target_obj) {
+        GST_WARNING ("clock_sync: target pipeline '%s' not found, skipping",
+            name);
+        if (!first_skipped)
+          g_string_append_c (skipped_json, ',');
+        escaped = json_escape_string (name);
+        g_string_append_printf (skipped_json, "\"%s\"", escaped);
+        g_free (escaped);
+        first_skipped = FALSE;
+        continue;
+      }
+
+      target_elem = gstd_pipeline_get_element (GSTD_PIPELINE (target_obj));
+      if (!target_elem) {
+        GST_WARNING ("clock_sync: target pipeline '%s' element not available,"
+            " skipping", name);
+        g_object_unref (target_obj);
+        if (!first_skipped)
+          g_string_append_c (skipped_json, ',');
+        escaped = json_escape_string (name);
+        g_string_append_printf (skipped_json, "\"%s\"", escaped);
+        g_free (escaped);
+        first_skipped = FALSE;
+        continue;
+      }
+
+      gst_object_ref (target_elem);
+
+      if (clock) {
+        gst_element_set_clock (target_elem, clock);
+      }
+      gst_element_set_base_time (target_elem, base_time);
+
+      gst_object_unref (target_elem);
+
+      GST_INFO ("clock_sync: synced %s -> %s (base_time %" GST_TIME_FORMAT ")",
+          source_name, name, GST_TIME_ARGS (base_time));
+
+      g_object_unref (target_obj);
+
+      if (!first_synced)
+        g_string_append_c (synced_json, ',');
+      escaped = json_escape_string (name);
+      g_string_append_printf (synced_json, "\"%s\"", escaped);
+      g_free (escaped);
+      first_synced = FALSE;
+    }
+
+    g_string_append_c (synced_json, ']');
+    g_string_append_c (skipped_json, ']');
+
+    if (clock) {
+      gst_object_unref (clock);
+    }
+    g_object_unref (source_obj);
+    g_strfreev (target_names);
+
+    {
+      gchar *ok_json = g_strdup_printf (
+          "{ \"code\": 0, \"description\": \"Success\","
+          " \"response\": { \"base_time\": %" G_GUINT64_FORMAT ","
+          " \"synced\": %s, \"skipped\": %s } }",
+          (guint64) base_time, synced_json->str, skipped_json->str);
+
+      g_string_free (synced_json, TRUE);
+      g_string_free (skipped_json, TRUE);
+
+#if SOUP_CHECK_VERSION(3,0,0)
+      soup_server_message_set_response (msg, "application/json",
+          SOUP_MEMORY_TAKE, ok_json, strlen (ok_json));
+      soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+      soup_message_set_response (msg, "application/json",
+          SOUP_MEMORY_TAKE, ok_json, strlen (ok_json));
+      soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+    }
+  }
+  return;
+
+error_400:
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_server_message_set_status (msg, SOUP_STATUS_BAD_REQUEST, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
+#endif
+  return;
+
+error_404:
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_server_message_set_status (msg, SOUP_STATUS_NOT_FOUND, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_message_set_status (msg, SOUP_STATUS_NOT_FOUND);
+#endif
+  return;
+
+error_405:
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_server_message_set_status (msg,
+      SOUP_STATUS_METHOD_NOT_ALLOWED, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+#endif
+  return;
+
+error_500:
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_server_message_set_status (msg,
+      SOUP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, error_json, strlen (error_json));
+  soup_message_set_status (msg, SOUP_STATUS_INTERNAL_SERVER_ERROR);
+#endif
+  return;
+}
+
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
 server_callback (SoupServer * server, SoupMsg * msg,
@@ -679,6 +997,16 @@ server_callback (SoupServer * server, SoupMessage * msg,
    * This endpoint is optimized for frequent monitoring requests. */
   if (g_strcmp0 (path, "/pipelines/status") == 0) {
     handle_pipelines_status (server, msg, session);
+    return;
+  }
+
+  /* Fast path for inter-pipeline clock synchronization - bypass thread pool.
+   * Copies clock and base_time from a source pipeline to a target pipeline,
+   * which is required when rebuilding a consumer pipeline that uses
+   * intersrc/intersink while the producer pipeline keeps running.
+   * See: https://gstreamer.freedesktop.org/documentation/rsinter/intersrc.html */
+  if (g_strcmp0 (path, "/pipelines/clock_sync") == 0) {
+    handle_clock_sync (server, msg, query, session);
     return;
   }
 

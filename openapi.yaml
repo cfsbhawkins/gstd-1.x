@@ -116,6 +116,89 @@ paths:
                       state: PAUSED
                   count: 2
 
+  /pipelines/clock_sync:
+    post:
+      tags:
+        - Pipelines
+      summary: Synchronize clock between pipelines (fast path)
+      description: |
+        Copies the GstClock reference and base_time from a single source pipeline
+        to one or more target pipelines. This is required by inter-pipeline elements
+        (intersink/intersrc) when consumer pipelines are rebuilt while the producer
+        pipeline keeps running.
+
+        Without clock synchronization, rebuilt consumer pipelines have a different
+        time domain and buffers appear to arrive in the future, causing the sink
+        to wait indefinitely (frozen video).
+
+        Multiple targets are specified as a comma-separated list. Targets that
+        are not found are skipped (reported in `skipped`) rather than failing
+        the entire request — this is intentional for pipeline rebuild scenarios
+        where some consumers may not exist yet.
+
+        This endpoint bypasses the thread pool for minimal latency.
+
+        **Note:** This endpoint is custom to this fork and not available in upstream gstd.
+      operationId: clockSync
+      parameters:
+        - name: source
+          in: query
+          required: true
+          description: Name of the source pipeline to copy clock and base_time from
+          schema:
+            type: string
+          example: my_ingest_pipeline
+        - name: targets
+          in: query
+          required: true
+          description: |
+            Comma-separated list of target pipeline names to apply clock and
+            base_time to. Pipelines that don't exist are skipped gracefully.
+          schema:
+            type: string
+          example: my_output,my_preview,my_framegrab
+      responses:
+        '200':
+          description: Clock and base_time synchronized successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClockSyncResponse'
+              example:
+                code: 0
+                description: Success
+                response:
+                  base_time: 12345678901234
+                  synced:
+                    - my_output
+                    - my_preview
+                  skipped:
+                    - my_framegrab
+        '400':
+          description: Missing required query parameters (source, targets)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Source pipeline not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '405':
+          description: Method not allowed (only POST is accepted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Source pipeline element not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /pipelines:
     get:
       tags:
@@ -1043,6 +1126,29 @@ components:
                 count:
                   type: integer
                   description: Total number of pipelines
+
+    ClockSyncResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                base_time:
+                  type: integer
+                  format: int64
+                  description: The base_time (in nanoseconds) copied from the source pipeline
+                synced:
+                  type: array
+                  items:
+                    type: string
+                  description: Target pipelines that were successfully synchronized
+                skipped:
+                  type: array
+                  items:
+                    type: string
+                  description: Target pipelines that were not found (skipped gracefully)
 
     CreatePipelineRequest:
       type: object
