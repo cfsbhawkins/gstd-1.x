@@ -867,6 +867,40 @@ handle_clock_sync (SoupServer * server, SoupMessage * msg,
       }
       gst_element_set_base_time (target_elem, base_time);
 
+      /* Propagate base_time to all descendant elements.
+       *
+       * gst_element_set_clock() already propagates recursively (GstBin
+       * overrides it), but gst_element_set_base_time() does NOT — it is
+       * a simple field setter with no virtual dispatch.
+       *
+       * Elements inside bins with locked-state=TRUE (e.g. rtspclientsink's
+       * internal rtspbin/rtpbin/multiudpsink) get their own base_time
+       * during their independent state transition. This causes buffers
+       * from intersrc to land in the wrong time domain, blocking the
+       * internal sync=TRUE sinks indefinitely.
+       *
+       * Recursively setting base_time ensures every element — including
+       * those inside locked-state sub-bins — shares the producer's time
+       * domain, which is exactly what inter-pipeline clock sync requires.
+       */
+      if (GST_IS_BIN (target_elem)) {
+        GstIterator *it = gst_bin_iterate_recurse (GST_BIN (target_elem));
+        GValue item = G_VALUE_INIT;
+        GstIteratorResult res;
+
+        while ((res = gst_iterator_next (it, &item)) != GST_ITERATOR_DONE) {
+          if (res == GST_ITERATOR_OK) {
+            GstElement *child = GST_ELEMENT (g_value_get_object (&item));
+            gst_element_set_base_time (child, base_time);
+            g_value_reset (&item);
+          } else if (res == GST_ITERATOR_RESYNC) {
+            gst_iterator_resync (it);
+          }
+        }
+        g_value_unset (&item);
+        gst_iterator_free (it);
+      }
+
       gst_object_unref (target_elem);
 
       GST_INFO ("clock_sync: synced %s -> %s (base_time %" GST_TIME_FORMAT ")",
