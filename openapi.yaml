@@ -28,6 +28,8 @@ tags:
     description: Pipeline lifecycle management
   - name: State
     description: Pipeline state control
+  - name: Element Registry
+    description: GStreamer element factory registry lookup (fork-specific)
   - name: Elements
     description: Pipeline element access
   - name: Properties
@@ -194,6 +196,79 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Source pipeline element not available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /elements/{element_name}:
+    get:
+      tags:
+        - Element Registry
+      summary: Check if a GStreamer element exists (fast path)
+      description: |
+        Checks whether a GStreamer element factory exists in the plugin registry.
+        Returns element metadata (klass, description, author, license) if found,
+        or 404 if the element is not available.
+
+        This enables capability detection at startup — for example, checking
+        whether hardware-accelerated elements like `v4l2convert` (Jetson/iMX8),
+        `vaapih264enc` (VAAPI), or `nvh264enc` (NVIDIA) are available without
+        creating throwaway pipelines.
+
+        Uses `gst_element_factory_find()` which is a thread-safe read from the
+        immutable plugin registry hash table. This endpoint bypasses the thread
+        pool (fast path).
+
+        **Note:** This endpoint is custom to this fork and not available in upstream gstd.
+      operationId: checkElement
+      parameters:
+        - name: element_name
+          in: path
+          required: true
+          description: GStreamer element factory name to look up
+          schema:
+            type: string
+          example: v4l2convert
+      responses:
+        '200':
+          description: Element factory exists in the registry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ElementCheckResponse'
+              example:
+                code: 0
+                description: Success
+                response:
+                  name: v4l2convert
+                  available: true
+                  klass: Filter/Converter/Video/Scaler
+                  description: Colorspace converter and target scaler using V4L2 API
+                  author: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+                  license: LGPL
+        '400':
+          description: Element name missing from path
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: 1
+                description: "Element name required: use /elements/<name>"
+                response: null
+        '404':
+          description: Element factory not found in registry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: 1
+                description: "Element 'nonexistent' not found in registry"
+                response: null
+        '405':
+          description: Method not allowed (only GET is accepted)
           content:
             application/json:
               schema:
@@ -1149,6 +1224,33 @@ components:
                   items:
                     type: string
                   description: Target pipelines that were not found (skipped gracefully)
+
+    ElementCheckResponse:
+      allOf:
+        - $ref: '#/components/schemas/BaseResponse'
+        - type: object
+          properties:
+            response:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: GStreamer element factory name
+                available:
+                  type: boolean
+                  description: Always true when element is found (200 response)
+                klass:
+                  type: string
+                  description: Element classification (e.g., Filter/Converter/Video/Scaler)
+                description:
+                  type: string
+                  description: Human-readable element description
+                author:
+                  type: string
+                  description: Element author
+                license:
+                  type: string
+                  description: Plugin license (e.g., LGPL, GPL, BSD, proprietary)
 
     CreatePipelineRequest:
       type: object
