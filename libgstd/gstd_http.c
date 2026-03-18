@@ -666,6 +666,173 @@ json_escape_string (const gchar * s)
 }
 
 /**
+ * handle_element_check:
+ * @server: the SoupServer handling the request
+ * @msg: the HTTP message to respond to
+ * @element_name: the GStreamer element factory name to look up
+ *
+ * Checks if a GStreamer element factory exists in the plugin registry.
+ * Returns 200 with element metadata if found, 404 if not.
+ *
+ * Uses gst_element_factory_find() which is a thread-safe read from the
+ * immutable plugin registry hash table — safe for the fast path.
+ *
+ * Used by an external client to detect hardware capabilities at startup
+ * (e.g., v4l2convert for M2M hardware conversion on Jetson/iMX8).
+ *
+ * HTTP: GET /elements/<element_name>
+ *
+ * Note: This endpoint is custom to this fork and not available in upstream gstd.
+ */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+handle_element_check (SoupServer * server, SoupMsg * msg,
+    const gchar * element_name)
+#else
+handle_element_check (SoupServer * server, SoupMessage * msg,
+    const gchar * element_name)
+#endif
+{
+  GstElementFactory *factory;
+  SoupMessageHeaders *response_headers = NULL;
+  const gchar *method = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Origin", "*");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Headers", "origin,range,content-type");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Methods", "GET");
+
+  /* Allow CORS preflight through */
+#if SOUP_CHECK_VERSION(3,0,0)
+  method = soup_server_message_get_method (msg);
+#else
+  method = msg->method;
+#endif
+  if (method == SOUP_METHOD_OPTIONS) {
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+    soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+    return;
+  }
+  if (method != SOUP_METHOD_GET) {
+    static const char *method_error =
+        "{ \"code\": 1, \"description\": \"Method not allowed:"
+        " use GET\", \"response\": null }";
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_response (msg, "application/json",
+        SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+    soup_server_message_set_status (msg,
+        SOUP_STATUS_METHOD_NOT_ALLOWED, NULL);
+#else
+    soup_message_set_response (msg, "application/json",
+        SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+    soup_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+#endif
+    return;
+  }
+
+  factory = gst_element_factory_find (element_name);
+  if (factory) {
+    const gchar *klass;
+    const gchar *desc;
+    const gchar *author;
+    const gchar *license;
+    GstPlugin *plugin;
+    gchar *escaped_name;
+    gchar *escaped_klass;
+    gchar *escaped_desc;
+    gchar *escaped_author;
+    gchar *escaped_license;
+    gchar *json;
+
+    klass = gst_element_factory_get_metadata (factory,
+        GST_ELEMENT_METADATA_KLASS);
+    desc = gst_element_factory_get_metadata (factory,
+        GST_ELEMENT_METADATA_DESCRIPTION);
+    author = gst_element_factory_get_metadata (factory,
+        GST_ELEMENT_METADATA_AUTHOR);
+
+    /* License lives on the plugin, not the element factory */
+    plugin = gst_plugin_feature_get_plugin (GST_PLUGIN_FEATURE (factory));
+    license = plugin ? gst_plugin_get_license (plugin) : NULL;
+
+    escaped_name = json_escape_string (element_name);
+    escaped_klass = json_escape_string (klass ? klass : "");
+    escaped_desc = json_escape_string (desc ? desc : "");
+    escaped_author = json_escape_string (author ? author : "");
+    escaped_license = json_escape_string (license ? license : "");
+
+    json = g_strdup_printf (
+        "{\n"
+        "  \"code\" : 0,\n"
+        "  \"description\" : \"Success\",\n"
+        "  \"response\" : {\n"
+        "    \"name\" : \"%s\",\n"
+        "    \"available\" : true,\n"
+        "    \"klass\" : \"%s\",\n"
+        "    \"description\" : \"%s\",\n"
+        "    \"author\" : \"%s\",\n"
+        "    \"license\" : \"%s\"\n"
+        "  }\n"
+        "}",
+        escaped_name, escaped_klass, escaped_desc,
+        escaped_author, escaped_license);
+
+    g_free (escaped_name);
+    g_free (escaped_klass);
+    g_free (escaped_desc);
+    g_free (escaped_author);
+    g_free (escaped_license);
+    if (plugin)
+      gst_object_unref (plugin);
+    gst_object_unref (factory);
+
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_response (msg, "application/json",
+        SOUP_MEMORY_TAKE, json, strlen (json));
+    soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+    soup_message_set_response (msg, "application/json",
+        SOUP_MEMORY_TAKE, json, strlen (json));
+    soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+  } else {
+    gchar *escaped_name;
+    gchar *json;
+
+    escaped_name = json_escape_string (element_name);
+    json = g_strdup_printf (
+        "{\n"
+        "  \"code\" : 1,\n"
+        "  \"description\" : \"Element '%s' not found in registry\",\n"
+        "  \"response\" : null\n"
+        "}",
+        escaped_name);
+
+    g_free (escaped_name);
+
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_response (msg, "application/json",
+        SOUP_MEMORY_TAKE, json, strlen (json));
+    soup_server_message_set_status (msg, SOUP_STATUS_NOT_FOUND, NULL);
+#else
+    soup_message_set_response (msg, "application/json",
+        SOUP_MEMORY_TAKE, json, strlen (json));
+    soup_message_set_status (msg, SOUP_STATUS_NOT_FOUND);
+#endif
+  }
+}
+
+/**
  * handle_clock_sync:
  * @server: the SoupServer handling the request
  * @msg: the HTTP message to respond to
@@ -1041,6 +1208,37 @@ server_callback (SoupServer * server, SoupMessage * msg,
    * See: https://gstreamer.freedesktop.org/documentation/rsinter/intersrc.html */
   if (g_strcmp0 (path, "/pipelines/clock_sync") == 0) {
     handle_clock_sync (server, msg, query, session);
+    return;
+  }
+
+  /* Fast path for element registry lookup - bypass thread pool.
+   * Checks if a GStreamer element factory exists without creating a pipeline.
+   * Used by an external client to detect hardware capabilities at startup
+   * (e.g., v4l2convert for M2M hardware conversion on Jetson/iMX8).
+   *
+   * HTTP: GET /elements/<element_name>
+   *
+   * Note: This endpoint is custom to this fork and not available in upstream gstd. */
+  if (g_str_has_prefix (path, "/elements/")) {
+    const gchar *element_name = path + strlen ("/elements/");
+    if (element_name[0] != '\0') {
+      handle_element_check (server, msg, element_name);
+    } else {
+      /* /elements/ with no name — return 400 rather than falling through
+       * to the thread pool where it would be misinterpreted as a gstd path */
+      static const char *missing_name =
+          "{ \"code\": 1, \"description\": \"Element name required:"
+          " use /elements/<name>\", \"response\": null }";
+#if SOUP_CHECK_VERSION(3,0,0)
+      soup_server_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, missing_name, strlen (missing_name));
+      soup_server_message_set_status (msg, SOUP_STATUS_BAD_REQUEST, NULL);
+#else
+      soup_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, missing_name, strlen (missing_name));
+      soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
+#endif
+    }
     return;
   }
 
