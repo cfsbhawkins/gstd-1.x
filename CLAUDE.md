@@ -38,13 +38,17 @@ make check
 ## Dependencies
 
 Required packages:
-- gstreamer-1.0, gstreamer-base-1.0 (>= 1.0.0)
+- gstreamer-1.0, gstreamer-base-1.0 (>= 1.0.0 per meson.build; CI exercises 1.28.x)
 - json-glib-1.0 (>= 0.16.2)
 - jansson (>= 2.7)
 - gio-2.0, gio-unix-2.0 (>= 2.44.1)
 - libsoup-3.0 (>= 3.0) or libsoup-2.4 (fallback)
 - libdaemon (>= 0.14)
 - libedit (>= 3.0)
+
+The project is C and relies on GStreamer's stable 1.x ABI, so it builds
+against any 1.x GStreamer. CI (`Dockerfile`, `Dockerfile.valgrind`) uses
+`debian:sid-slim`, which currently ships GStreamer 1.28.x.
 
 ## Code Style
 
