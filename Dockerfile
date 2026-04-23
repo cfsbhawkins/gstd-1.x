@@ -1,10 +1,13 @@
-FROM ubuntu:22.04
+# Debian Sid currently ships GStreamer 1.28.x, which is the version this
+# CI image targets for build and test.
+FROM debian:sid-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     automake \
+    build-essential \
     libtool \
     pkg-config \
     libgstreamer1.0-dev \
@@ -13,7 +16,7 @@ RUN apt-get update && apt-get install -y \
     libjson-glib-dev \
     gtk-doc-tools \
     libedit-dev \
-    libncursesw5-dev \
+    libncurses-dev \
     libdaemon-dev \
     libjansson-dev \
     libsoup-3.0-dev \
