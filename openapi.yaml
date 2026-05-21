@@ -7,9 +7,13 @@ info:
     This API allows you to create, read, update, and delete GStreamer pipelines and their
     properties over HTTP. All responses follow a consistent JSON envelope format.
 
+    Request bodies larger than 8 MiB are rejected with `413 Request Entity Too
+    Large`; pipeline descriptions and property values are well within this
+    bound, so normal clients are unaffected.
+
     For additional documentation, see the official RidgeRun wiki:
     https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
-  version: 0.15.2
+  version: 0.16.2
   license:
     name: LGPL-2.0
     url: https://www.gnu.org/licenses/lgpl-2.0.html
@@ -322,6 +326,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body exceeds the 8 MiB limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /pipelines/{pipeline_name}:
     parameters:
@@ -595,6 +605,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Property not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body exceeds the 8 MiB limit
           content:
             application/json:
               schema:
