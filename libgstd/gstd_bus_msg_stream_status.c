@@ -143,7 +143,8 @@ gstd_bus_msg_stream_status_to_string (GstdBusMsg * msg,
 
   gstd_iformatter_set_member_name (formatter, "owner_factory");
   factory = gst_element_get_factory (owner);
-  gstd_iformatter_set_string_value (formatter, GST_OBJECT_NAME (factory));
+  gstd_iformatter_set_string_value (formatter,
+      factory ? GST_OBJECT_NAME (factory) : "(unknown)");
 
   gstd_iformatter_end_object (formatter);
 

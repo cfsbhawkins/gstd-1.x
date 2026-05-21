@@ -137,6 +137,7 @@ noconnection:
     g_printerr ("%s\n", error->message);
     g_error_free (error);
     g_socket_service_stop (*service);
+    g_object_unref (*service);
     *service = NULL;
     return GSTD_NO_CONNECTION;
   }

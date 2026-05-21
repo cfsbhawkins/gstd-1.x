@@ -154,6 +154,7 @@ gstd_unix_create_socket_service (GstdSocket * base, GSocketService ** service)
     g_socket_listener_add_address (G_SOCKET_LISTENER (*service),
         address,
         G_SOCKET_TYPE_STREAM, G_SOCKET_PROTOCOL_DEFAULT, NULL, NULL, &error);
+    g_object_unref (address);
     if (error)
       goto noconnection;
   }
@@ -164,6 +165,7 @@ noconnection:
     GST_ERROR_OBJECT (self, "%s", error->message);
     g_error_free (error);
     g_socket_service_stop (*service);
+    g_object_unref (*service);
     *service = NULL;
     return GSTD_NO_CONNECTION;
   }

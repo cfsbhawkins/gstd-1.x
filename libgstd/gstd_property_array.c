@@ -151,7 +151,8 @@ gstd_property_array_update (GstdObject * object, const gchar * value)
 
 out:
   {
-    g_free (tokens);
+    g_array_unref (garray);
+    g_strfreev (tokens);
     return ret;
   }
 }

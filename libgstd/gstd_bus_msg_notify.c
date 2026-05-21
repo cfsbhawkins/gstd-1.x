@@ -92,6 +92,8 @@ gstd_bus_msg_notify_to_string (GstdBusMsg * msg, GstdIFormatter * formatter,
   gst_message_parse_property_notify (target, &object, &property_name,
       &property_value);
 
+  ret = GSTD_EOK;
+
   object_name = gst_object_get_path_string (GST_OBJECT (object));
 
   if (property_value != NULL) {

@@ -196,6 +196,8 @@ gstd_action_to_string (GstdObject * obj, gchar ** outstring)
 
   gstd_iformatter_generate (formatter, outstring);
 
+  g_object_unref (formatter);
+
   return GSTD_EOK;
 }
 

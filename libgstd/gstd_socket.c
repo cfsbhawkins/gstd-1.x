@@ -131,7 +131,7 @@ gstd_socket_callback (GSocketService * service,
   istream = g_io_stream_get_input_stream (G_IO_STREAM (connection));
   ostream = g_io_stream_get_output_stream (G_IO_STREAM (connection));
 
-  message = g_malloc (size);
+  message = g_malloc (size + 1);
 
   while (TRUE) {
     read = g_input_stream_read (istream, message, size, NULL, &error);
@@ -233,6 +233,10 @@ gstd_socket_start (GstdIpc * base, GstdSession * session)
 
   /* start the socket service */
   g_socket_service_start (service);
+
+  /* Store the service so gstd_socket_stop() can shut it down and release
+   * it; otherwise it would leak and never stop on restart. */
+  self->service = service;
 
   return GSTD_EOK;
 }

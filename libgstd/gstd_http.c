@@ -677,8 +677,9 @@ json_escape_string (const gchar * s)
  * Uses gst_element_factory_find() which is a thread-safe read from the
  * immutable plugin registry hash table — safe for the fast path.
  *
- * Used by an external client to detect hardware capabilities at startup
- * (e.g., v4l2convert for M2M hardware conversion on Jetson/iMX8).
+ * Lets a client probe element/hardware capabilities at startup without
+ * creating a pipeline (e.g., checking that a hardware-accelerated converter
+ * element is available before building a pipeline).
  *
  * HTTP: GET /elements/<element_name>
  *
@@ -1062,6 +1063,9 @@ handle_clock_sync (SoupServer * server, SoupMessage * msg,
             g_value_reset (&item);
           } else if (res == GST_ITERATOR_RESYNC) {
             gst_iterator_resync (it);
+          } else {
+            /* GST_ITERATOR_ERROR: stop instead of spinning forever */
+            break;
           }
         }
         g_value_unset (&item);
@@ -1213,8 +1217,9 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
   /* Fast path for element registry lookup - bypass thread pool.
    * Checks if a GStreamer element factory exists without creating a pipeline.
-   * Used by an external client to detect hardware capabilities at startup
-   * (e.g., v4l2convert for M2M hardware conversion on Jetson/iMX8).
+   * Lets a client probe element/hardware capabilities at startup (e.g.,
+   * checking that a hardware-accelerated converter element is available
+   * before building a pipeline).
    *
    * HTTP: GET /elements/<element_name>
    *

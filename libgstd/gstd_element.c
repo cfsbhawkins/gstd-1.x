@@ -635,44 +635,16 @@ gstd_element_fill_signals_and_actions (GstdElement * self)
 static GType
 gstd_element_property_get_type (GType g_type)
 {
-
-  //FIXME:
-  //I just found a way to handle all types in a generic way, hence,
-  //the base property class can handle them all. I don't want to remove
-  //specific type sublasses because the to_string method may require to
-  //add details. For example, int properties can display their max and min
-  //values, flags and enums could display the options, etc... Similar to
-  //what gst-inspect does
-
+  /* The base GstdProperty class handles every type generically (read, update
+   * and serialization all work through the stored pspec). Arrays use a
+   * dedicated subclass because their value formatting differs. The per-type
+   * subclasses (int, string, enum, ...) still exist and could be selected
+   * here if their to_string ever needs type-specific detail (min/max, enum
+   * options, etc., like gst-inspect), but they are intentionally not used
+   * for now. */
   if (g_type == G_TYPE_ARRAY) {
     return GSTD_TYPE_PROPERTY_ARRAY;
-  } else {
-    return GSTD_TYPE_PROPERTY;
   }
 
-  switch (g_type) {
-    case G_TYPE_BOOLEAN:
-    {
-      return GSTD_TYPE_PROPERTY_BOOLEAN;
-    }
-    case G_TYPE_INT:
-    case G_TYPE_UINT:
-    case G_TYPE_UINT64:
-    case G_TYPE_INT64:
-    {
-      return GSTD_TYPE_PROPERTY_INT;
-    }
-    case G_TYPE_STRING:
-    {
-      return GSTD_TYPE_PROPERTY_STRING;
-    }
-    default:
-    {
-      if (G_TYPE_IS_ENUM (g_type)) {
-        return GSTD_TYPE_PROPERTY_ENUM;
-      } else {
-        return GSTD_TYPE_PROPERTY;
-      }
-    }
-  }
+  return GSTD_TYPE_PROPERTY;
 }

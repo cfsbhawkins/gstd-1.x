@@ -212,9 +212,9 @@ paths:
         or 404 if the element is not available.
 
         This enables capability detection at startup — for example, checking
-        whether hardware-accelerated elements like `v4l2convert` (Jetson/iMX8),
-        `vaapih264enc` (VAAPI), or `nvh264enc` (NVIDIA) are available without
-        creating throwaway pipelines.
+        whether hardware-accelerated elements (such as `v4l2convert`,
+        `vaapih264enc`, or `nvh264enc`) are available without creating
+        throwaway pipelines.
 
         Uses `gst_element_factory_find()` which is a thread-safe read from the
         immutable plugin registry hash table. This endpoint bypasses the thread

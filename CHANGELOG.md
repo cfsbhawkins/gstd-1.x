@@ -18,6 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Non-array and non-child-proxy properties were already correct (handled by
     the base `GstdProperty` update path); they are covered by new tests to
     prevent regression.
+- **Code-review fixes across the daemon** (mostly pre-existing defects)
+  - `gstd_socket.c`: one-byte heap overflow on a maximum-size read; the socket
+    service was never stored back into the object so it could not be stopped or
+    released.
+  - `gstd_event_handler.c`: stored a borrowed receiver reference but unref'd it
+    on dispose (refcount underflow); now uses `g_value_dup_object`.
+  - Memory leaks: `GArray`/token leaks in `gstd_property_array.c`; formatter in
+    `gstd_action.c`; receiver in `gstd_event_creator.c` (added dispose); socket
+    address/service in `gstd_unix.c` and `gstd_tcp.c`; split tokens on argument
+    errors in `gstd_parser.c`; state object on the pipeline-delete error path.
+  - Robustness: `gstd_bus_msg_notify.c` always returned an error code on
+    success; NULL element-factory deref in `gstd_bus_msg_stream_status.c`;
+    infinite loop on `GST_ITERATOR_ERROR` in `gstd_http.c`; NULL token passed to
+    `printf` in event seek/flush_stop; missing parent dispose chain in
+    `gstd_signal_reader.c`.
+  - Cleanup: removed unreachable code in `gstd_element.c` property-type
+    selection; aligned `gstd_property_int.c` with the pspec/bare-name pattern.
 
 ### Added
 - **Regression tests for GstChildProxy property access**
