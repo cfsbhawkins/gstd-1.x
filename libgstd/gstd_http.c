@@ -40,6 +40,11 @@ GST_DEBUG_CATEGORY_STATIC (gstd_http_debug);
 
 #define GSTD_DEBUG_DEFAULT_LEVEL GST_LEVEL_INFO
 
+/* Upper bound on the request body we are willing to parse. Pipeline
+ * descriptions and property values are small, so a generous cap is safe for
+ * every client while bounding the work done on a hostile oversized request. */
+#define GSTD_HTTP_MAX_BODY_SIZE (8 * 1024 * 1024)
+
 #if SOUP_CHECK_VERSION(3,0,0)
 typedef SoupServerMessage SoupMsg;
 #else
@@ -94,6 +99,7 @@ static GstdReturnCode do_delete (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
 static void do_request (gpointer data_request, gpointer eval);
 static void parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc);
+static gchar *json_escape_string (const gchar * s);
 #if SOUP_CHECK_VERSION(3,0,0)
 static void server_callback (SoupServer * server, SoupMsg * msg,
     const char *path, GHashTable * query, gpointer data);
@@ -474,6 +480,12 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     goto out;
   }
 
+  /* Bound the work on an oversized body (defends chunked requests with no
+   * Content-Length, which the early check in server_callback cannot catch). */
+  if (body_length > GSTD_HTTP_MAX_BODY_SIZE) {
+    goto out;
+  }
+
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
     g_clear_error (&err);
@@ -599,6 +611,7 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
   for (iter = pipelines; iter != NULL; iter = g_list_next (iter)) {
     GstdPipeline *pipeline = GSTD_PIPELINE (iter->data);
     const gchar *name;
+    gchar *escaped_name;
     GstState current_state = GST_STATE_NULL;
 
     name = GSTD_OBJECT_NAME (pipeline);
@@ -621,10 +634,12 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
     }
     first = FALSE;
 
+    escaped_name = json_escape_string (name);
     g_string_append_printf (json,
         "\n      {\"name\": \"%s\", \"state\": \"%s\"}",
-        name,
+        escaped_name,
         gst_element_state_get_name (current_state));
+    g_free (escaped_name);
 
     gst_object_unref (pipeline);
   }
@@ -658,9 +673,38 @@ json_escape_string (const gchar * s)
 {
   GString *out = g_string_new (NULL);
   for (; *s; s++) {
-    if (*s == '"' || *s == '\\')
-      g_string_append_c (out, '\\');
-    g_string_append_c (out, *s);
+    guchar c = (guchar) *s;
+    switch (c) {
+      case '"':
+        g_string_append (out, "\\\"");
+        break;
+      case '\\':
+        g_string_append (out, "\\\\");
+        break;
+      case '\b':
+        g_string_append (out, "\\b");
+        break;
+      case '\f':
+        g_string_append (out, "\\f");
+        break;
+      case '\n':
+        g_string_append (out, "\\n");
+        break;
+      case '\r':
+        g_string_append (out, "\\r");
+        break;
+      case '\t':
+        g_string_append (out, "\\t");
+        break;
+      default:
+        /* Escape remaining control characters per RFC 8259; leave raw UTF-8
+         * bytes (>= 0x80) untouched so multibyte sequences pass through. */
+        if (c < 0x20)
+          g_string_append_printf (out, "\\u%04x", c);
+        else
+          g_string_append_c (out, (gchar) c);
+        break;
+    }
   }
   return g_string_free (out, FALSE);
 }
@@ -1245,6 +1289,35 @@ server_callback (SoupServer * server, SoupMessage * msg,
 #endif
     }
     return;
+  }
+
+  /* Reject oversized request bodies up front (DoS guard). Pipeline
+   * descriptions and property values are small, so the cap never affects a
+   * legitimate client. */
+  {
+    SoupMessageHeaders *req_headers = NULL;
+    static const char *too_large =
+        "{ \"code\": 1, \"description\": \"Request body too large\","
+        " \"response\": null }";
+#if SOUP_CHECK_VERSION(3,0,0)
+    req_headers = soup_server_message_get_request_headers (msg);
+#else
+    req_headers = msg->request_headers;
+#endif
+    if (req_headers && soup_message_headers_get_content_length (req_headers) >
+        GSTD_HTTP_MAX_BODY_SIZE) {
+#if SOUP_CHECK_VERSION(3,0,0)
+      soup_server_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+      soup_server_message_set_status (msg,
+          SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE, NULL);
+#else
+      soup_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+      soup_message_set_status (msg, SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE);
+#endif
+      return;
+    }
   }
 
   data_request = g_new0 (GstdHttpRequest, 1);

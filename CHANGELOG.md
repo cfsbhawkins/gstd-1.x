@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `gstd_signal_reader.c`.
   - Cleanup: removed unreachable code in `gstd_element.c` property-type
     selection; aligned `gstd_property_int.c` with the pspec/bare-name pattern.
+- **HTTP boundary hardening** (`gstd_http.c`)
+  - JSON output injection: `/pipelines/status` emitted pipeline names without
+    escaping, so a name containing `"` or control characters could inject into
+    or invalidate the JSON response. Names are now escaped.
+  - `json_escape_string` now escapes control characters (RFC 8259), not just
+    `"` and `\`.
+  - Added an 8 MiB request-body cap (returns 413) to bound resource use on
+    hostile oversized requests; legitimate descriptions/values are unaffected.
 
 ### Added
 - **Regression tests for GstChildProxy property access**
