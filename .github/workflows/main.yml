@@ -24,7 +24,7 @@
         image: ubuntu:${{ matrix.ubuntu_version }}
 
       steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Dependecies
         run: |
           export DEBIAN_FRONTEND=noninteractive
@@ -59,7 +59,7 @@
         fail-fast: false
         matrix:
           ubuntu_version: [ "20.04", "22.04", "24.04" ]
-            include:
+          include:
             - ubuntu_version: "24.04"
               meson_opts: "-Dpython.install_env=auto"
             - ubuntu_version: "20.04"
@@ -70,7 +70,7 @@
         image: ubuntu:${{ matrix.ubuntu_version }}
 
       steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Dependecies
         run: |
           export DEBIAN_FRONTEND=noninteractive

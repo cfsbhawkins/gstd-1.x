@@ -7,9 +7,13 @@ info:
     This API allows you to create, read, update, and delete GStreamer pipelines and their
     properties over HTTP. All responses follow a consistent JSON envelope format.
 
+    Request bodies larger than 8 MiB are rejected with `413 Request Entity Too
+    Large`; pipeline descriptions and property values are well within this
+    bound, so normal clients are unaffected.
+
     For additional documentation, see the official RidgeRun wiki:
     https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
-  version: 0.15.2
+  version: 0.16.2
   license:
     name: LGPL-2.0
     url: https://www.gnu.org/licenses/lgpl-2.0.html
@@ -212,9 +216,9 @@ paths:
         or 404 if the element is not available.
 
         This enables capability detection at startup — for example, checking
-        whether hardware-accelerated elements like `v4l2convert` (Jetson/iMX8),
-        `vaapih264enc` (VAAPI), or `nvh264enc` (NVIDIA) are available without
-        creating throwaway pipelines.
+        whether hardware-accelerated elements (such as `v4l2convert`,
+        `vaapih264enc`, or `nvh264enc`) are available without creating
+        throwaway pipelines.
 
         Uses `gst_element_factory_find()` which is a thread-safe read from the
         immutable plugin registry hash table. This endpoint bypasses the thread
@@ -318,6 +322,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
           description: Pipeline with this name already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body exceeds the 8 MiB limit
           content:
             application/json:
               schema:
@@ -548,10 +558,26 @@ paths:
       tags:
         - Properties
       summary: Set property value
-      description: Updates the value of an element property
+      description: >-
+        Updates the value of an element property. The new value may be supplied
+        either as a JSON request body `{"name": "<value>"}` or as a `name`
+        query parameter (`?name=<value>`); the JSON body takes precedence when
+        both are present. Works for prefixed child-proxy properties such as
+        `sink_0::alpha` (see the property_name parameter).
       operationId: setProperty
+      parameters:
+        - name: name
+          in: query
+          required: false
+          description: >-
+            New property value, as an alternative to the JSON request body.
+            Used by clients that prefer query parameters,
+            e.g. `?name=0.5` for `sink_0::alpha`.
+          schema:
+            type: string
+          example: "0.5"
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema:
@@ -579,6 +605,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Property not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: Request body exceeds the 8 MiB limit
           content:
             application/json:
               schema:
@@ -1098,10 +1130,22 @@ components:
       name: property_name
       in: path
       required: true
-      description: Name of the property
+      description: >-
+        Name of the property. For properties of a GstChildProxy element's
+        children (for example the request sink pads of `compositor`), use the
+        prefixed name `<child>::<property>`, e.g. `sink_0::alpha` or
+        `sink_0::xpos`. The `::` separator is sent literally in the path
+        segment (it does not need to be URL-encoded). Both GET (read) and PUT
+        (set) operate on the underlying child object.
       schema:
         type: string
-      example: pattern
+      examples:
+        plain:
+          value: pattern
+          summary: Plain element property
+        childProxy:
+          value: sink_0::alpha
+          summary: Child-proxy (compositor pad) property
     SignalName:
       name: signal_name
       in: path

@@ -46,6 +46,7 @@ struct _GstdEventCreatorClass
 static void
 gstd_event_creator_set_property (GObject *,
     guint, const GValue *, GParamSpec *);
+static void gstd_event_creator_dispose (GObject *);
 static GstdReturnCode gstd_event_creator_create (GstdICreator * iface,
     const gchar * name, const gchar * description, GstdObject ** out);
 
@@ -84,6 +85,7 @@ gstd_event_creator_class_init (GstdEventCreatorClass * klass)
   GParamSpec *properties[N_PROPERTIES] = { NULL, };
   guint debug_color;
   object_class->set_property = gstd_event_creator_set_property;
+  object_class->dispose = gstd_event_creator_dispose;
 
   properties[PROP_RECEIVER] =
       g_param_spec_object ("receiver",
@@ -105,6 +107,19 @@ gstd_event_creator_init (GstdEventCreator * self)
 {
   GST_INFO_OBJECT (self, "Initializing gstd event creator");
   self->receiver = NULL;
+}
+
+static void
+gstd_event_creator_dispose (GObject * object)
+{
+  GstdEventCreator *self = GSTD_EVENT_CREATOR (object);
+
+  if (self->receiver) {
+    g_object_unref (self->receiver);
+    self->receiver = NULL;
+  }
+
+  G_OBJECT_CLASS (gstd_event_creator_parent_class)->dispose (object);
 }
 
 static GstdReturnCode

@@ -32,6 +32,11 @@
 #define check_argument(arg, code) \
     if (NULL == (arg)) return (code)
 
+/* Variant for use after a g_strsplit into a local "tokens" array: frees the
+ * tokens before returning so a missing argument does not leak the split. */
+#define check_argument_free(arg, code) \
+    do { if (NULL == (arg)) { g_strfreev (tokens); return (code); } } while (0)
+
 /**
  * Prototypes for the functions
  */
@@ -476,8 +481,8 @@ gstd_parser_pipeline_verbose (GstdSession * session, gchar * action,
 
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/verbose %s", tokens[0], tokens[1]);
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "update", uri, response);
@@ -505,10 +510,10 @@ gstd_parser_element_set (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (args, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 4);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
-  check_argument (tokens[3], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[3], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/elements/%s/properties/%s %s",
       tokens[0], tokens[1], tokens[2], tokens[3]);
@@ -532,9 +537,9 @@ gstd_parser_element_get (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (args, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 3);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/elements/%s/properties/%s",
       tokens[0], tokens[1], tokens[2]);
@@ -591,8 +596,8 @@ gstd_parser_list_properties (GstdSession * session, gchar * action,
   g_return_val_if_fail (args, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
 
   uri =
       g_strdup_printf ("/pipelines/%s/elements/%s/properties", tokens[0],
@@ -617,8 +622,8 @@ gstd_parser_list_signals (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (args, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
 
   uri =
       g_strdup_printf ("/pipelines/%s/elements/%s/signals", tokens[0],
@@ -663,8 +668,8 @@ gstd_parser_bus_filter (GstdSession * session, gchar * action,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/bus/types %s", tokens[0], tokens[1]);
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "update", uri, response);
@@ -688,8 +693,8 @@ gstd_parser_bus_timeout (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/bus/timeout %s", tokens[0], tokens[1]);
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "update", uri, response);
@@ -732,10 +737,11 @@ gstd_parser_event_seek (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
   // We don't check for the second token since we want to allow defaults
 
-  uri = g_strdup_printf ("/pipelines/%s/event seek %s", tokens[0], tokens[1]);
+  uri = g_strdup_printf ("/pipelines/%s/event seek %s", tokens[0],
+      tokens[1] ? tokens[1] : "");
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "create", uri, response);
 
   g_free (uri);
@@ -776,12 +782,12 @@ gstd_parser_event_flush_stop (GstdSession * session, gchar * action,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 2);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
   // We don't check for the second token since we want to allow defaults
 
   uri =
       g_strdup_printf ("/pipelines/%s/event flush_stop %s", tokens[0],
-      tokens[1]);
+      tokens[1] ? tokens[1] : "");
   ret = gstd_parser_parse_raw_cmd (session, (gchar *) "create", uri, response);
 
   g_free (uri);
@@ -885,9 +891,9 @@ gstd_parser_signal_connect (GstdSession * session, gchar * action,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 3);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/elements/%s/signals/%s/callback",
       tokens[0], tokens[1], tokens[2]);
@@ -913,9 +919,9 @@ gstd_parser_signal_disconnect (GstdSession * session, gchar * action,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 3);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/elements/%s/signals/%s/disconnect",
       tokens[0], tokens[1], tokens[2]);
@@ -940,9 +946,9 @@ gstd_parser_action_emit (GstdSession * session, gchar * action,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 4);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
 
   /* tokens[3] may be NULL for no-arg actions */
   if (tokens[3] && tokens[3][0] != '\0') {
@@ -974,10 +980,10 @@ gstd_parser_signal_timeout (GstdSession * session, gchar * action, gchar * args,
   g_return_val_if_fail (response, GSTD_NULL_ARGUMENT);
 
   tokens = g_strsplit (args, " ", 4);
-  check_argument (tokens[0], GSTD_BAD_COMMAND);
-  check_argument (tokens[1], GSTD_BAD_COMMAND);
-  check_argument (tokens[2], GSTD_BAD_COMMAND);
-  check_argument (tokens[3], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[0], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[1], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[2], GSTD_BAD_COMMAND);
+  check_argument_free (tokens[3], GSTD_BAD_COMMAND);
 
   uri = g_strdup_printf ("/pipelines/%s/elements/%s/signals/%s/timeout %s",
       tokens[0], tokens[1], tokens[2], tokens[3]);

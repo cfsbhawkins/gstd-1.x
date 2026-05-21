@@ -111,6 +111,8 @@ gstd_signal_reader_dispose (GObject * object)
 
   g_mutex_clear (&self->signal_lock);
   g_cond_clear (&self->signal_call);
+
+  G_OBJECT_CLASS (gstd_signal_reader_parent_class)->dispose (object);
 }
 
 static GstdReturnCode

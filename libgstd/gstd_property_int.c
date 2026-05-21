@@ -83,8 +83,15 @@ gstd_property_int_update (GstdObject * object, const gchar * value)
 
   prop = GSTD_PROPERTY (object);
 
-  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
-      GSTD_OBJECT_NAME (prop));
+  /* Prefer the pspec stored at construction so child-proxy properties
+   * (whose GstdObject name is prefixed, e.g. "sink_0::xpos") resolve to the
+   * bare property name the target object understands. */
+  if (prop->pspec) {
+    pspec = prop->pspec;
+  } else {
+    pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
+        GSTD_OBJECT_NAME (prop));
+  }
 
   g_return_val_if_fail (pspec, GSTD_MISSING_INITIALIZATION);
 
@@ -120,7 +127,7 @@ gstd_property_int_update (GstdObject * object, const gchar * value)
       goto out;
   }
 
-  g_object_set (prop->target, GSTD_OBJECT_NAME (prop), parsed, NULL);
+  g_object_set (prop->target, pspec->name, parsed, NULL);
 
 out:
   {

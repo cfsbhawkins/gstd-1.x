@@ -98,10 +98,10 @@ gstd_pipeline_deleter_delete (GstdIDeleter * iface, GstdObject * object)
     return ret;
 
   ret = gstd_object_update (state, "NULL");
+  g_object_unref (state);
   if (ret)
     return ret;
 
-  g_object_unref (state);
   g_object_unref (object);
 
   return ret;

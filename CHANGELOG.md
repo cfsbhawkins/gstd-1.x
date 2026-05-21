@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-05-21
+
+### Fixed
+- **GstChildProxy array-property writes used the prefixed name** (`gstd_property_array.c`)
+  - `gstd_property_array_update()` looked up the pspec and called `g_object_set`
+    with the prefixed GstdObject name (e.g. `sink_0::positions`) instead of the
+    bare property name. For child-proxy children this made the lookup fail
+    (returning `GSTD_MISSING_INITIALIZATION`) and the write silently miss.
+  - Now prefers the pspec stored at construction and writes with `pspec->name`,
+    matching the read path and the base-class update handler.
+  - Non-array and non-child-proxy properties were already correct (handled by
+    the base `GstdProperty` update path); they are covered by new tests to
+    prevent regression.
+- **Code-review fixes across the daemon** (mostly pre-existing defects)
+  - `gstd_socket.c`: one-byte heap overflow on a maximum-size read; the socket
+    service was never stored back into the object so it could not be stopped or
+    released.
+  - `gstd_event_handler.c`: stored a borrowed receiver reference but unref'd it
+    on dispose (refcount underflow); now uses `g_value_dup_object`.
+  - Memory leaks: `GArray`/token leaks in `gstd_property_array.c`; formatter in
+    `gstd_action.c`; receiver in `gstd_event_creator.c` (added dispose); socket
+    address/service in `gstd_unix.c` and `gstd_tcp.c`; split tokens on argument
+    errors in `gstd_parser.c`; state object on the pipeline-delete error path.
+  - Robustness: `gstd_bus_msg_notify.c` always returned an error code on
+    success; NULL element-factory deref in `gstd_bus_msg_stream_status.c`;
+    infinite loop on `GST_ITERATOR_ERROR` in `gstd_http.c`; NULL token passed to
+    `printf` in event seek/flush_stop; missing parent dispose chain in
+    `gstd_signal_reader.c`.
+  - Cleanup: removed unreachable code in `gstd_element.c` property-type
+    selection; aligned `gstd_property_int.c` with the pspec/bare-name pattern.
+- **HTTP boundary hardening** (`gstd_http.c`)
+  - JSON output injection: `/pipelines/status` emitted pipeline names without
+    escaping, so a name containing `"` or control characters could inject into
+    or invalidate the JSON response. Names are now escaped.
+  - `json_escape_string` now escapes control characters (RFC 8259), not just
+    `"` and `\`.
+  - Added an 8 MiB request-body cap (returns 413) to bound resource use on
+    hostile oversized requests; legitimate descriptions/values are unaffected.
+
+### Added
+- **Regression tests for GstChildProxy property access**
+  (`tests/gstd/test_gstd_childproxy_property.c`)
+  - Verifies `compositor` request-pad properties are enumerated under prefixed
+    names and that GET/PUT round-trips work for `sink_0::alpha` (double),
+    `sink_0::xpos` (int), plus a plain (non-child-proxy) property.
+
+### Documentation
+- **OpenAPI**: documented prefixed child-proxy property names
+  (`sink_0::alpha`) on the `property_name` path parameter, and the `?name=`
+  query-parameter alternative to the JSON body on `setProperty`.
+
 ## [0.16.1] - 2026-01-14
 
 ### Added
