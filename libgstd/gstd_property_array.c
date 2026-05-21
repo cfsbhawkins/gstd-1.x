@@ -95,6 +95,7 @@ gstd_property_array_update (GstdObject * object, const gchar * value)
 {
   GstdProperty *prop;
   GParamSpec *pspec;
+  const gchar *prop_name;
   GstdReturnCode ret = GSTD_EOK;
   GArray *garray;
   gchar **tokens;
@@ -107,10 +108,20 @@ gstd_property_array_update (GstdObject * object, const gchar * value)
 
   prop = GSTD_PROPERTY (object);
 
-  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
-      GSTD_OBJECT_NAME (prop));
+  /* Prefer the pspec stored at construction. For GstChildProxy children the
+   * GstdObject name is prefixed (e.g. "sink_0::positions"), but the target
+   * object only knows the bare property name. Looking it up by the prefixed
+   * name fails, and writing with it would silently miss. */
+  if (prop->pspec) {
+    pspec = prop->pspec;
+  } else {
+    pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
+        GSTD_OBJECT_NAME (prop));
+  }
 
   g_return_val_if_fail (pspec, GSTD_MISSING_INITIALIZATION);
+
+  prop_name = pspec->name;
 
   errno = 0;
 
@@ -131,7 +142,7 @@ gstd_property_array_update (GstdObject * object, const gchar * value)
     g_array_append_val (garray, f_token);
   }
   if (garray != NULL) {
-    g_object_set (prop->target, GSTD_OBJECT_NAME (prop), garray, NULL);
+    g_object_set (prop->target, prop_name, garray, NULL);
   } else {
     GST_ERROR_OBJECT (object, "Cannot update %s: Array is empty", pspec->name);
     ret = GSTD_BAD_VALUE;

@@ -35,6 +35,14 @@ gst_client/gst-client-1.0
 __pycache__
 autoregen.sh
 
+# Editor / tooling
+.cache/
+compile_commands.json
+.vscode/
+.idea/
+.DS_Store
+*.registry
+
 # debian files
 *.deb
 *.build

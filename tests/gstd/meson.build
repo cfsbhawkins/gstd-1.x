@@ -7,6 +7,7 @@ gstd_tests = [
   ['test_gstd_stability.c'],
   ['test_gstd_refcount.c'],
   ['test_gstd_parser.c'],
+  ['test_gstd_childproxy_property.c'],
 ]
 
 # Add C Definitions for tests

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-05-21
+
+### Fixed
+- **GstChildProxy array-property writes used the prefixed name** (`gstd_property_array.c`)
+  - `gstd_property_array_update()` looked up the pspec and called `g_object_set`
+    with the prefixed GstdObject name (e.g. `sink_0::positions`) instead of the
+    bare property name. For child-proxy children this made the lookup fail
+    (returning `GSTD_MISSING_INITIALIZATION`) and the write silently miss.
+  - Now prefers the pspec stored at construction and writes with `pspec->name`,
+    matching the read path and the base-class update handler.
+  - Non-array and non-child-proxy properties were already correct (handled by
+    the base `GstdProperty` update path); they are covered by new tests to
+    prevent regression.
+
+### Added
+- **Regression tests for GstChildProxy property access**
+  (`tests/gstd/test_gstd_childproxy_property.c`)
+  - Verifies `compositor` request-pad properties are enumerated under prefixed
+    names and that GET/PUT round-trips work for `sink_0::alpha` (double),
+    `sink_0::xpos` (int), plus a plain (non-child-proxy) property.
+
+### Documentation
+- **OpenAPI**: documented prefixed child-proxy property names
+  (`sink_0::alpha`) on the `property_name` path parameter, and the `?name=`
+  query-parameter alternative to the JSON body on `setProperty`.
+
 ## [0.16.1] - 2026-01-14
 
 ### Added
