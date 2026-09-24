@@ -8,6 +8,8 @@ gstd_tests = [
   ['test_gstd_refcount.c'],
   ['test_gstd_parser.c'],
   ['test_gstd_childproxy_property.c'],
+  ['test_gstd_pipeline_limit.c'],
+  ['test_gstd_http.c'],
 ]
 
 # Add C Definitions for tests

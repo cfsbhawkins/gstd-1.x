@@ -67,10 +67,27 @@ struct _GstdHttp
   guint port;
   gchar *address;
   gint max_threads;
+  /* Optional bearer token required on every request except /health and
+   * CORS preflights. NULL disables authentication (the default). */
+  gchar *api_token;
+  /* Origin allowed in CORS response headers. NULL (the default) emits no
+   * CORS headers at all, so browsers refuse cross-origin reads. */
+  gchar *cors_origin;
   SoupServer *server;
   GstdSession *session;
   GThreadPool *pool;
   GMutex mutex;
+};
+
+enum
+{
+  PROP_0,
+  PROP_PORT,
+  PROP_ADDRESS,
+  PROP_MAX_THREADS,
+  PROP_API_TOKEN,
+  PROP_CORS_ORIGIN,
+  N_PROPERTIES
 };
 
 struct _GstdHttpClass
@@ -109,18 +126,55 @@ static void server_callback (SoupServer * server, SoupMessage * msg,
     gpointer data);
 #endif
 
+static void gstd_http_set_property (GObject * object, guint property_id,
+    const GValue * value, GParamSpec * pspec);
+static void gstd_http_get_property (GObject * object, guint property_id,
+    GValue * value, GParamSpec * pspec);
+
 static void
 gstd_http_class_init (GstdHttpClass * klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
   GstdIpcClass *gstdipc_class = GSTD_IPC_CLASS (klass);
+  GParamSpec *properties[N_PROPERTIES] = { NULL, };
   guint debug_color;
 
   gstdipc_class->get_option_group =
       GST_DEBUG_FUNCPTR (gstd_http_init_get_option_group);
   gstdipc_class->start = GST_DEBUG_FUNCPTR (gstd_http_start);
   object_class->finalize = gstd_http_finalize;
+  object_class->set_property = gstd_http_set_property;
+  object_class->get_property = gstd_http_get_property;
   gstdipc_class->stop = GST_DEBUG_FUNCPTR (gstd_http_stop);
+
+  properties[PROP_PORT] =
+      g_param_spec_uint ("port", "Port",
+      "The port the HTTP server listens on",
+      0, G_MAXUINT16, GSTD_HTTP_DEFAULT_PORT, G_PARAM_READWRITE);
+
+  properties[PROP_ADDRESS] =
+      g_param_spec_string ("address", "Address",
+      "The address the HTTP server binds to",
+      NULL, G_PARAM_READWRITE);
+
+  properties[PROP_MAX_THREADS] =
+      g_param_spec_int ("max-threads", "Max threads",
+      "Max number of threads processing simultaneous requests (-1 unlimited)",
+      -1, G_MAXINT, GSTD_HTTP_DEFAULT_MAX_THREADS, G_PARAM_READWRITE);
+
+  properties[PROP_API_TOKEN] =
+      g_param_spec_string ("api-token", "API token",
+      "Bearer token required on every request except /health "
+      "(NULL disables authentication)",
+      NULL, G_PARAM_READWRITE);
+
+  properties[PROP_CORS_ORIGIN] =
+      g_param_spec_string ("cors-origin", "CORS origin",
+      "Origin allowed in CORS response headers "
+      "(NULL emits no CORS headers)",
+      NULL, G_PARAM_READWRITE);
+
+  g_object_class_install_properties (object_class, N_PROPERTIES, properties);
 
   /* Initialize debug category with nice colors */
   debug_color = GST_DEBUG_FG_BLACK | GST_DEBUG_BOLD | GST_DEBUG_BG_WHITE;
@@ -138,10 +192,71 @@ gstd_http_init (GstdHttp * self)
    * pointer without freeing it, so a preallocated default would leak. */
   self->address = NULL;
   self->max_threads = GSTD_HTTP_DEFAULT_MAX_THREADS;
+  self->api_token = NULL;
+  self->cors_origin = NULL;
   self->server = NULL;
   self->session = NULL;
   self->pool = NULL;
 
+}
+
+static void
+gstd_http_set_property (GObject * object, guint property_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstdHttp *self = GSTD_HTTP (object);
+
+  switch (property_id) {
+    case PROP_PORT:
+      self->port = g_value_get_uint (value);
+      break;
+    case PROP_ADDRESS:
+      g_free (self->address);
+      self->address = g_value_dup_string (value);
+      break;
+    case PROP_MAX_THREADS:
+      self->max_threads = g_value_get_int (value);
+      break;
+    case PROP_API_TOKEN:
+      g_free (self->api_token);
+      self->api_token = g_value_dup_string (value);
+      break;
+    case PROP_CORS_ORIGIN:
+      g_free (self->cors_origin);
+      self->cors_origin = g_value_dup_string (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+      break;
+  }
+}
+
+static void
+gstd_http_get_property (GObject * object, guint property_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstdHttp *self = GSTD_HTTP (object);
+
+  switch (property_id) {
+    case PROP_PORT:
+      g_value_set_uint (value, self->port);
+      break;
+    case PROP_ADDRESS:
+      g_value_set_string (value, self->address);
+      break;
+    case PROP_MAX_THREADS:
+      g_value_set_int (value, self->max_threads);
+      break;
+    case PROP_API_TOKEN:
+      g_value_set_string (value, self->api_token);
+      break;
+    case PROP_CORS_ORIGIN:
+      g_value_set_string (value, self->cors_origin);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+      break;
+  }
 }
 
 static void
@@ -163,6 +278,16 @@ gstd_http_finalize (GObject * object)
     self->address = NULL;
   }
 
+  if (self->api_token) {
+    g_free (self->api_token);
+    self->api_token = NULL;
+  }
+
+  if (self->cors_origin) {
+    g_free (self->cors_origin);
+    self->cors_origin = NULL;
+  }
+
   if (self->pool) {
     g_thread_pool_free (self->pool, FALSE, TRUE);
     self->pool = NULL;
@@ -182,13 +307,155 @@ get_status_code (GstdReturnCode ret)
     status = SOUP_STATUS_NOT_FOUND;
   } else if (ret == GSTD_EXISTING_RESOURCE) {
     status = SOUP_STATUS_CONFLICT;
-  } else if (ret == GSTD_BAD_VALUE) {
-    status = SOUP_STATUS_NO_CONTENT;
+  } else if (ret == GSTD_MAX_LIMIT_REACHED) {
+    /* 429 Too Many Requests; not all libsoup versions name it */
+    status = (SoupStatus) 429;
   } else {
+    /* Including GSTD_BAD_VALUE: a rejected value is a client error, not
+     * a 204 No Content success as previously mapped. */
     status = SOUP_STATUS_BAD_REQUEST;
   }
 
   return status;
+}
+
+/*
+ * Append CORS headers only when an allowed origin was configured.
+ * With no origin configured (the default) no CORS headers are emitted,
+ * so browsers refuse cross-origin access to the API.
+ */
+static void
+add_cors_headers (GstdHttp * self, SoupMessageHeaders * response_headers,
+    const gchar * methods)
+{
+  if (!self || !self->cors_origin || self->cors_origin[0] == '\0') {
+    return;
+  }
+
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Origin", self->cors_origin);
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Headers",
+      "origin,range,content-type,authorization");
+  soup_message_headers_append (response_headers,
+      "Access-Control-Allow-Methods", methods);
+  if (g_strcmp0 (self->cors_origin, "*") != 0) {
+    soup_message_headers_append (response_headers, "Vary", "Origin");
+  }
+}
+
+/*
+ * Compare secrets without an early exit on the first differing byte.
+ * Comparing SHA-256 digests keeps the timing independent of how much
+ * of the attempt matches the real token.
+ */
+static gboolean
+token_equal (const gchar * expected, const gchar * provided)
+{
+  gchar *expected_digest = NULL;
+  gchar *provided_digest = NULL;
+  gboolean equal = FALSE;
+
+  expected_digest =
+      g_compute_checksum_for_string (G_CHECKSUM_SHA256, expected, -1);
+  provided_digest =
+      g_compute_checksum_for_string (G_CHECKSUM_SHA256, provided, -1);
+
+  equal = (g_strcmp0 (expected_digest, provided_digest) == 0);
+
+  g_free (expected_digest);
+  g_free (provided_digest);
+
+  return equal;
+}
+
+/*
+ * Validate the Authorization header against the configured API token.
+ * Returns TRUE when no token is configured (authentication disabled).
+ */
+static gboolean
+request_authorized (GstdHttp * self, SoupMsg * msg)
+{
+  SoupMessageHeaders *request_headers = NULL;
+  const gchar *authorization = NULL;
+  static const gchar bearer_prefix[] = "Bearer ";
+
+  if (!self->api_token || self->api_token[0] == '\0') {
+    return TRUE;
+  }
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_headers = soup_server_message_get_request_headers (msg);
+#else
+  request_headers = msg->request_headers;
+#endif
+  if (!request_headers) {
+    return FALSE;
+  }
+
+  authorization = soup_message_headers_get_one (request_headers,
+      "Authorization");
+  if (!authorization) {
+    return FALSE;
+  }
+
+  if (g_ascii_strncasecmp (authorization, bearer_prefix,
+          strlen (bearer_prefix)) != 0) {
+    return FALSE;
+  }
+
+  return token_equal (self->api_token,
+      authorization + strlen (bearer_prefix));
+}
+
+static void
+respond_unauthorized (GstdHttp * self, SoupMsg * msg)
+{
+  static const char *unauthorized =
+      "{ \"code\": 1, \"description\": \"Unauthorized: missing or invalid"
+      " API token\", \"response\": null }";
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+  soup_message_headers_append (response_headers, "WWW-Authenticate",
+      "Bearer");
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, unauthorized, strlen (unauthorized));
+  soup_server_message_set_status (msg, SOUP_STATUS_UNAUTHORIZED, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, unauthorized, strlen (unauthorized));
+  soup_message_set_status (msg, SOUP_STATUS_UNAUTHORIZED);
+#endif
+}
+
+/*
+ * A resource name travels inside the space-separated parser command
+ * language, so whitespace or control characters in it would be
+ * re-tokenized as extra command arguments. Reject those up front;
+ * legitimate object names never need them.
+ */
+static gboolean
+is_valid_resource_name (const gchar * name)
+{
+  const gchar *c;
+
+  if (!name || name[0] == '\0') {
+    return FALSE;
+  }
+
+  for (c = name; *c; c++) {
+    if ((guchar) * c <= 0x20 || (guchar) * c == 0x7f) {
+      return FALSE;
+    }
+  }
+
+  return TRUE;
 }
 
 static GstdReturnCode
@@ -230,6 +497,13 @@ do_post (SoupServer * server, SoupMsg * msg, char *name,
     ret = GSTD_BAD_VALUE;
     GST_ERROR_OBJECT (session,
         "Wrong query param provided, \"name\" doesn't exist");
+    goto out;
+  }
+
+  if (!is_valid_resource_name (name)) {
+    ret = GSTD_BAD_VALUE;
+    GST_ERROR_OBJECT (session,
+        "Rejecting \"name\" with whitespace or control characters");
     goto out;
   }
 
@@ -295,6 +569,13 @@ do_delete (SoupServer * server, SoupMsg * msg, char *name,
     ret = GSTD_BAD_VALUE;
     GST_ERROR_OBJECT (session,
         "Wrong query param provided, \"name\" doesn't exist");
+    goto out;
+  }
+
+  if (!is_valid_resource_name (name)) {
+    ret = GSTD_BAD_VALUE;
+    GST_ERROR_OBJECT (session,
+        "Rejecting \"name\" with whitespace or control characters");
     goto out;
   }
 
@@ -524,9 +805,10 @@ out:
 
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
-handle_health_request (SoupServer * server, SoupMsg * msg)
+handle_health_request (GstdHttp * self, SoupServer * server, SoupMsg * msg)
 #else
-handle_health_request (SoupServer * server, SoupMessage * msg)
+handle_health_request (GstdHttp * self, SoupServer * server,
+    SoupMessage * msg)
 #endif
 {
   /* Simple liveness check - if HTTP server responds, gstd is alive.
@@ -541,12 +823,7 @@ handle_health_request (SoupServer * server, SoupMessage * msg)
   response_headers = msg->response_headers;
 #endif
 
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", "*");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Headers", "origin,range,content-type");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Methods", "GET");
+  add_cors_headers (self, response_headers, "GET");
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
@@ -567,11 +844,11 @@ handle_health_request (SoupServer * server, SoupMessage * msg)
  */
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
-handle_pipelines_status (SoupServer * server, SoupMsg * msg,
+handle_pipelines_status (GstdHttp * self, SoupServer * server, SoupMsg * msg,
     GstdSession * session)
 #else
-handle_pipelines_status (SoupServer * server, SoupMessage * msg,
-    GstdSession * session)
+handle_pipelines_status (GstdHttp * self, SoupServer * server,
+    SoupMessage * msg, GstdSession * session)
 #endif
 {
   GString *json;
@@ -587,12 +864,7 @@ handle_pipelines_status (SoupServer * server, SoupMessage * msg,
   response_headers = msg->response_headers;
 #endif
 
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", "*");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Headers", "origin,range,content-type");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Methods", "GET");
+  add_cors_headers (self, response_headers, "GET");
 
   json = g_string_new ("{\n  \"code\" : 0,\n  \"description\" : \"OK\",\n");
   g_string_append (json, "  \"response\" : {\n    \"pipelines\": [");
@@ -734,11 +1006,11 @@ json_escape_string (const gchar * s)
  */
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
-handle_element_check (SoupServer * server, SoupMsg * msg,
+handle_element_check (GstdHttp * self, SoupServer * server, SoupMsg * msg,
     const gchar * element_name)
 #else
-handle_element_check (SoupServer * server, SoupMessage * msg,
-    const gchar * element_name)
+handle_element_check (GstdHttp * self, SoupServer * server,
+    SoupMessage * msg, const gchar * element_name)
 #endif
 {
   GstElementFactory *factory;
@@ -750,12 +1022,7 @@ handle_element_check (SoupServer * server, SoupMessage * msg,
 #else
   response_headers = msg->response_headers;
 #endif
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", "*");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Headers", "origin,range,content-type");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Methods", "GET");
+  add_cors_headers (self, response_headers, "GET");
 
   /* Allow CORS preflight through */
 #if SOUP_CHECK_VERSION(3,0,0)
@@ -929,10 +1196,10 @@ handle_element_check (SoupServer * server, SoupMessage * msg,
  */
 static void
 #if SOUP_CHECK_VERSION(3,0,0)
-handle_clock_sync (SoupServer * server, SoupMsg * msg,
+handle_clock_sync (GstdHttp * self, SoupServer * server, SoupMsg * msg,
     GHashTable * query, GstdSession * session)
 #else
-handle_clock_sync (SoupServer * server, SoupMessage * msg,
+handle_clock_sync (GstdHttp * self, SoupServer * server, SoupMessage * msg,
     GHashTable * query, GstdSession * session)
 #endif
 {
@@ -953,12 +1220,7 @@ handle_clock_sync (SoupServer * server, SoupMessage * msg,
   response_headers = msg->response_headers;
 #endif
 
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", "*");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Headers", "origin,range,content-type");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Methods", "POST");
+  add_cors_headers (self, response_headers, "POST");
 
   /* Allow CORS preflight through, reject non-POST for actual requests */
 #if SOUP_CHECK_VERSION(3,0,0)
@@ -1231,24 +1493,40 @@ server_callback (SoupServer * server, SoupMessage * msg,
   GstdHttp *self = NULL;
   GstdHttpRequest *data_request = NULL;
   SoupMessageHeaders *response_headers = NULL;
+  const gchar *method = NULL;
 
   g_return_if_fail (server);
   g_return_if_fail (msg);
   g_return_if_fail (data);
 
-  /* Fast path for health checks - bypass thread pool */
+  self = GSTD_HTTP (data);
+  session = self->session;
+
+  /* Fast path for health checks - bypass thread pool. Exempt from
+   * authentication so container liveness probes need no credentials;
+   * it exposes nothing but the fact that the server responds. */
   if (g_strcmp0 (path, "/health") == 0) {
-    handle_health_request (server, msg);
+    handle_health_request (self, server, msg);
     return;
   }
 
-  self = GSTD_HTTP (data);
-  session = self->session;
+#if SOUP_CHECK_VERSION(3,0,0)
+  method = soup_server_message_get_method (msg);
+#else
+  method = msg->method;
+#endif
+
+  /* When an API token is configured, every other endpoint requires it.
+   * OPTIONS stays exempt: CORS preflights carry no credentials. */
+  if (method != SOUP_METHOD_OPTIONS && !request_authorized (self, msg)) {
+    respond_unauthorized (self, msg);
+    return;
+  }
 
   /* Fast path for pipeline status polling - bypass thread pool.
    * This endpoint is optimized for frequent monitoring requests. */
   if (g_strcmp0 (path, "/pipelines/status") == 0) {
-    handle_pipelines_status (server, msg, session);
+    handle_pipelines_status (self, server, msg, session);
     return;
   }
 
@@ -1258,7 +1536,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
    * intersrc/intersink while the producer pipeline keeps running.
    * See: https://gstreamer.freedesktop.org/documentation/rsinter/intersrc.html */
   if (g_strcmp0 (path, "/pipelines/clock_sync") == 0) {
-    handle_clock_sync (server, msg, query, session);
+    handle_clock_sync (self, server, msg, query, session);
     return;
   }
 
@@ -1274,7 +1552,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
   if (g_str_has_prefix (path, "/elements/")) {
     const gchar *element_name = path + strlen ("/elements/");
     if (element_name[0] != '\0') {
-      handle_element_check (server, msg, element_name);
+      handle_element_check (self, server, msg, element_name);
     } else {
       /* /elements/ with no name — return 400 rather than falling through
        * to the thread pool where it would be misinterpreted as a gstd path */
@@ -1346,12 +1624,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
 #else
   response_headers = msg->response_headers;
 #endif
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", "*");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Headers", "origin,range,content-type");
-  soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Methods", "PUT, GET, POST, DELETE");
+  add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
   g_mutex_lock (&self->mutex);
 #if SOUP_CHECK_VERSION(3,2,0)
   soup_server_message_pause (msg);
@@ -1401,6 +1674,19 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (NULL == self->address)
     self->address = g_strdup (GSTD_HTTP_DEFAULT_ADDRESS);
   address = self->address;
+
+  /* Environment fallbacks for settings not given on the command line.
+   * The env var is the recommended way to pass the token, since command
+   * line arguments are visible to other local processes. */
+  if (NULL == self->api_token) {
+    self->api_token = g_strdup (g_getenv ("GSTD_HTTP_API_TOKEN"));
+  }
+  if (NULL == self->cors_origin) {
+    self->cors_origin = g_strdup (g_getenv ("GSTD_HTTP_CORS_ORIGIN"));
+  }
+  if (self->api_token) {
+    GST_INFO_OBJECT (self, "HTTP API token authentication enabled");
+  }
 
   self->session = session;
   gstd_http_stop (base);
@@ -1480,6 +1766,19 @@ gstd_http_init_get_option_group (GstdIpc * base, GOptionGroup ** group)
           "Max number of allowed threads to process simultaneous requests. -1 "
           "means unlimited (default -1)",
         "http-max-threads"}
+    ,
+    {"http-api-token", 0, 0, G_OPTION_ARG_STRING, &self->api_token,
+          "Require this bearer token on every request except /health. "
+          "Prefer the GSTD_HTTP_API_TOKEN environment variable: command "
+          "line arguments are visible to other local processes "
+          "(default: authentication disabled)",
+        "token"}
+    ,
+    {"http-cors-origin", 0, 0, G_OPTION_ARG_STRING, &self->cors_origin,
+          "Origin allowed in CORS response headers, or GSTD_HTTP_CORS_ORIGIN "
+          "env var (default: no CORS headers, cross-origin browser access "
+          "disabled)",
+        "origin"}
     ,
     {NULL}
   };

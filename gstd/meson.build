@@ -38,9 +38,12 @@ install_subdir('gstd',
 )
 
 # Since install_subdir function doesn't change the mode of the directories installed
-# Run a script at install time to change the mode of the directories
-meson.add_install_script('gstd_chmod.sh','777', runstatedir)
-meson.add_install_script('gstd_chmod.sh','777', logstatedir)
+# Run a script at install time to change the mode of the directories.
+# 1777 (like /tmp): any user may run gstd and drop its pid/log/socket files
+# here, but the sticky bit stops users deleting or replacing each other's
+# files. Deployments with a dedicated gstd user should tighten this to 0750.
+meson.add_install_script('gstd_chmod.sh','1777', runstatedir)
+meson.add_install_script('gstd_chmod.sh','1777', logstatedir)
 
 ## Create symbolic link to gstd
 meson.add_install_script('gstd_symbolic_link.sh',

@@ -29,6 +29,7 @@
 
 #include "gstd_http.h"
 #include "gstd_ipc.h"
+#include "gstd_list.h"
 #include "gstd_log.h"
 #include "gstd_tcp.h"
 #include "gstd_unix.h"
@@ -165,6 +166,21 @@ gstd_new (GstD ** out, int argc, char *argv[])
   gstd_init (argc, argv);
 
   return ret;
+}
+
+void
+gstd_set_max_pipelines (GstD * gstd, guint max_pipelines)
+{
+  GstdList *pipelines = NULL;
+
+  g_return_if_fail (NULL != gstd);
+  g_return_if_fail (NULL != gstd->session);
+
+  g_object_get (gstd->session, "pipelines", &pipelines, NULL);
+  g_return_if_fail (NULL != pipelines);
+
+  g_object_set (pipelines, "max-children", max_pipelines, NULL);
+  g_object_unref (pipelines);
 }
 
 gboolean

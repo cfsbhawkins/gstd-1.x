@@ -54,6 +54,10 @@ struct _GstdList
 
   guint count;
 
+  /* Maximum number of children allowed in the list, 0 means unlimited.
+   * Read and written under the object lock. */
+  guint max_children;
+
   GType node_type;
 
   GParamFlags flags;

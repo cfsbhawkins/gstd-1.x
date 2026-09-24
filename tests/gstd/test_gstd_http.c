@@ -42,6 +42,15 @@
 
 static GstdSession *test_session = NULL;
 static GstdHttp *test_http = NULL;
+static GMainLoop *test_loop = NULL;
+static GThread *test_loop_thread = NULL;
+
+static gpointer
+main_loop_thread_func (gpointer data)
+{
+  g_main_loop_run ((GMainLoop *) data);
+  return NULL;
+}
 
 static void
 setup (void)
@@ -54,6 +63,21 @@ setup (void)
       "address", TEST_HTTP_ADDRESS,
       NULL);
   fail_if (NULL == test_http);
+
+  /* gstd_ipc_start is a no-op unless the IPC is enabled */
+  g_object_set (test_http, "enabled", TRUE, NULL);
+
+  /* The soup server dispatches on the default main context; run it from
+   * a thread so the blocking client calls in the tests get serviced. */
+  test_loop = g_main_loop_new (NULL, FALSE);
+  test_loop_thread = g_thread_new ("http-test-loop",
+      main_loop_thread_func, test_loop);
+
+  /* Don't proceed until the loop actually runs: g_main_loop_quit before
+   * g_main_loop_run is lost, which would leave teardown joining forever. */
+  while (!g_main_loop_is_running (test_loop)) {
+    g_usleep (1000);
+  }
 }
 
 static void
@@ -64,6 +88,13 @@ teardown (void)
     g_object_unref (test_http);
     test_http = NULL;
   }
+  if (test_loop) {
+    g_main_loop_quit (test_loop);
+    g_thread_join (test_loop_thread);
+    g_main_loop_unref (test_loop);
+    test_loop = NULL;
+    test_loop_thread = NULL;
+  }
   if (test_session) {
     g_object_unref (test_session);
     test_session = NULL;
@@ -71,10 +102,14 @@ teardown (void)
 }
 
 /*
- * Helper function to make HTTP request using GIO
+ * Helper to make a raw HTTP request using GIO. @request_target may carry a
+ * query string. @extra_header, when non-NULL, is inserted verbatim (without
+ * the trailing CRLF). Returns the body; the full raw response (headers
+ * included) is stored in @raw_out when non-NULL. Caller frees both.
  */
 static gchar *
-http_get (const gchar * path, guint * status_code)
+http_request (const gchar * method, const gchar * request_target,
+    const gchar * extra_header, guint * status_code, gchar ** raw_out)
 {
   GSocketClient *client;
   GSocketConnection *conn;
@@ -83,16 +118,22 @@ http_get (const gchar * path, guint * status_code)
   GError *error = NULL;
   gchar *request;
   gchar *response;
-  gsize bytes_read;
-  gchar buffer[4096];
+  gssize bytes_read;
+  gsize total_read = 0;
+  gchar buffer[8192];
+
+  *status_code = 0;
+  if (raw_out) {
+    *raw_out = NULL;
+  }
 
   client = g_socket_client_new ();
   conn = g_socket_client_connect_to_host (client,
       TEST_HTTP_ADDRESS, TEST_HTTP_PORT, NULL, &error);
 
   if (!conn) {
+    g_clear_error (&error);
     g_object_unref (client);
-    *status_code = 0;
     return NULL;
   }
 
@@ -100,13 +141,16 @@ http_get (const gchar * path, guint * status_code)
   istream = g_io_stream_get_input_stream (G_IO_STREAM (conn));
 
   request = g_strdup_printf (
-      "GET %s HTTP/1.1\r\n"
+      "%s %s HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "%s%s"
       "Connection: close\r\n"
       "\r\n",
-      path, TEST_HTTP_ADDRESS, TEST_HTTP_PORT);
+      method, request_target, TEST_HTTP_ADDRESS, TEST_HTTP_PORT,
+      extra_header ? extra_header : "", extra_header ? "\r\n" : "");
 
-  g_output_stream_write_all (ostream, request, strlen (request), NULL, NULL, &error);
+  g_output_stream_write_all (ostream, request, strlen (request), NULL, NULL,
+      &error);
   g_free (request);
 
   if (error) {
@@ -114,24 +158,27 @@ http_get (const gchar * path, guint * status_code)
     g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
     g_object_unref (conn);
     g_object_unref (client);
-    *status_code = 0;
     return NULL;
   }
 
-  bytes_read = g_input_stream_read (istream, buffer, sizeof (buffer) - 1, NULL, NULL);
-  if (bytes_read < 0) {
-    /* Read error */
-    g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
-    g_object_unref (conn);
-    g_object_unref (client);
-    *status_code = 0;
-    return NULL;
+  /* Connection: close, so read until EOF */
+  while (total_read < sizeof (buffer) - 1) {
+    bytes_read = g_input_stream_read (istream, buffer + total_read,
+        sizeof (buffer) - 1 - total_read, NULL, NULL);
+    if (bytes_read <= 0) {
+      break;
+    }
+    total_read += bytes_read;
   }
-  buffer[bytes_read] = '\0';
+  buffer[total_read] = '\0';
 
   /* Parse status code from HTTP response */
   if (sscanf (buffer, "HTTP/1.%*d %u", status_code) != 1) {
     *status_code = 0;
+  }
+
+  if (raw_out) {
+    *raw_out = g_strdup (buffer);
   }
 
   /* Find body after headers */
@@ -147,6 +194,12 @@ http_get (const gchar * path, guint * status_code)
   g_object_unref (client);
 
   return response;
+}
+
+static gchar *
+http_get (const gchar * path, guint * status_code)
+{
+  return http_request ("GET", path, NULL, status_code, NULL);
 }
 
 /*
@@ -194,7 +247,8 @@ GST_START_TEST (test_http_health_endpoint)
   response = http_get ("/health", &status_code);
   fail_if (status_code != 200, "Health endpoint returned %u, expected 200", status_code);
   fail_if (response == NULL);
-  fail_if (strstr (response, "ok") == NULL, "Health response should contain 'ok'");
+  fail_if (strstr (response, "healthy") == NULL,
+      "Health response should contain 'healthy'");
 
   g_free (response);
 }
@@ -339,6 +393,147 @@ GST_START_TEST (test_http_server_restart)
 }
 GST_END_TEST;
 
+/*
+ * Test: no CORS headers are emitted unless an origin is configured
+ */
+GST_START_TEST (test_http_no_cors_by_default)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  gchar *raw = NULL;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("GET", "/health", NULL, &status_code, &raw);
+  fail_if (status_code != 200);
+  fail_if (raw == NULL);
+  fail_if (strstr (raw, "Access-Control-Allow-Origin") != NULL,
+      "No CORS headers should be emitted without a configured origin");
+
+  g_free (response);
+  g_free (raw);
+}
+GST_END_TEST;
+
+/*
+ * Test: a configured CORS origin is echoed instead of a wildcard
+ */
+GST_START_TEST (test_http_cors_origin_configured)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  gchar *raw = NULL;
+  guint status_code;
+
+  g_object_set (test_http, "cors-origin", "http://example.com", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("GET", "/health", NULL, &status_code, &raw);
+  fail_if (status_code != 200);
+  fail_if (raw == NULL);
+  fail_if (strstr (raw,
+          "Access-Control-Allow-Origin: http://example.com") == NULL,
+      "Configured origin should appear in CORS headers");
+  fail_if (strstr (raw, "Access-Control-Allow-Origin: *") != NULL,
+      "Wildcard origin must not be emitted");
+
+  g_free (response);
+  g_free (raw);
+}
+GST_END_TEST;
+
+/*
+ * Test: with an API token configured, requests need a bearer token,
+ * while /health stays open for liveness probes
+ */
+GST_START_TEST (test_http_api_token)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  /* No credentials: rejected */
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 401,
+      "Request without token returned %u, expected 401", status_code);
+  g_free (response);
+
+  /* Wrong credentials: rejected */
+  response = http_request ("GET", "/pipelines",
+      "Authorization: Bearer wrong-token", &status_code, NULL);
+  fail_if (status_code != 401,
+      "Request with bad token returned %u, expected 401", status_code);
+  g_free (response);
+
+  /* Fast-path endpoints are covered too */
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (status_code != 401,
+      "Fast-path without token returned %u, expected 401", status_code);
+  g_free (response);
+
+  /* Correct credentials: accepted */
+  response = http_request ("GET", "/pipelines",
+      "Authorization: Bearer test-secret-token", &status_code, NULL);
+  fail_if (status_code != 200,
+      "Request with valid token returned %u, expected 200", status_code);
+  g_free (response);
+
+  /* Health probes stay unauthenticated */
+  response = http_get ("/health", &status_code);
+  fail_if (status_code != 200,
+      "/health with token configured returned %u, expected 200", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: resource names with whitespace are rejected before reaching the
+ * space-separated parser command language
+ */
+GST_START_TEST (test_http_rejects_name_with_whitespace)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  /* %20 decodes to a space inside the name */
+  response = http_request ("POST",
+      "/pipelines?name=evil%20injected&description=fakesrc%20!%20fakesink",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 400,
+      "POST with whitespace in name returned %u, expected 400", status_code);
+  g_free (response);
+
+  /* A clean name on the same endpoint still works */
+  response = http_request ("POST",
+      "/pipelines?name=clean_name&description=fakesrc%20!%20fakesink",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 200,
+      "POST with valid name returned %u, expected 200", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -357,6 +552,10 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_invalid_path);
   tcase_add_test (tc, test_http_concurrent_requests);
   tcase_add_test (tc, test_http_server_restart);
+  tcase_add_test (tc, test_http_no_cors_by_default);
+  tcase_add_test (tc, test_http_cors_origin_configured);
+  tcase_add_test (tc, test_http_api_token);
+  tcase_add_test (tc, test_http_rejects_name_with_whitespace);
 
   return suite;
 }

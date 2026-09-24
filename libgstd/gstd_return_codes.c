@@ -43,6 +43,7 @@ gstd_return_code_to_string (GstdReturnCode code)
     [GSTD_EVENT_ERROR] = "Event error",
     [GSTD_MISSING_ARGUMENT] = "One or more arguments are missing",
     [GSTD_MISSING_NAME] = "Name is missing",
+    [GSTD_MAX_LIMIT_REACHED] = "Resource limit reached",
   };
 
   const gint size = sizeof (code_description) / sizeof (gchar *);

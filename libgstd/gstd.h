@@ -68,9 +68,21 @@ void
 gstd_context_add_group (GstD *gstd, GOptionContext *context);
 
 /**
+ * gstd_set_max_pipelines:
+ * @gstd: The gstd returned by gstd_new()
+ * @max_pipelines: Maximum number of simultaneous pipelines allowed,
+ * 0 means unlimited.
+ *
+ * Caps the number of pipelines that clients may create, as a
+ * resource-exhaustion guard for the unauthenticated API.
+ */
+void
+gstd_set_max_pipelines (GstD * gstd, guint max_pipelines);
+
+/**
  * gstd_start:
  * @gstd: The gstd returned by gstd_new()
- * 
+ *
  * Starts the ipc in GstdIpc array
  *
  * Returns: GstdReturnCode indicating success or fail

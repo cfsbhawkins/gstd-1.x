@@ -126,6 +126,11 @@ enum _GstdReturnCode
    */
   GSTD_MISSING_NAME,
 
+  /**
+   * The configured maximum amount of resources was reached
+   */
+  GSTD_MAX_LIMIT_REACHED,
+
 };
 
 typedef enum _GstdReturnCode GstdReturnCode;

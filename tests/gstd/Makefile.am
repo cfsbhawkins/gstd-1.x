@@ -1,7 +1,9 @@
 TESTS = test_gstd_pipeline_create 	\
 	test_gstd_no_create 		\
 	test_gstd_state			\
-	test_gstd_stability
+	test_gstd_stability		\
+	test_gstd_pipeline_limit	\
+	test_gstd_http
 
 check_PROGRAMS = $(TESTS)
 

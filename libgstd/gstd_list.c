@@ -34,10 +34,12 @@ enum
   PROP_COUNT = 1,
   PROP_NODE_TYPE,
   PROP_FLAGS,
+  PROP_MAX_CHILDREN,
   N_PROPERTIES                  // NOT A PROPERTY
 };
 
 #define GSTD_LIST_DEFAULT_COUNT 0
+#define GSTD_LIST_DEFAULT_MAX_CHILDREN 0
 #define GSTD_LIST_DEFAULT_NODE_TYPE G_TYPE_NONE
 #define GSTD_LIST_DEFAULT_FLAGS GSTD_PARAM_READ | GSTD_PARAM_CREATE | GSTD_PARAM_DELETE
 
@@ -97,6 +99,12 @@ gstd_list_class_init (GstdListClass * klass)
       //                      G_PARAM_CONSTRUCT_ONLY |
       G_PARAM_READWRITE | GSTD_PARAM_READ);
 
+  properties[PROP_MAX_CHILDREN] =
+      g_param_spec_uint ("max-children",
+      "Max children",
+      "The maximum amount of nodes allowed in the list (0 means unlimited)",
+      0, G_MAXUINT, GSTD_LIST_DEFAULT_MAX_CHILDREN, G_PARAM_READWRITE);
+
   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
 
   gstd_object_class->create = gstd_list_create;
@@ -116,6 +124,7 @@ gstd_list_init (GstdList * self)
   self->list = NULL;
   self->count = GSTD_LIST_DEFAULT_COUNT;
   self->node_type = GSTD_LIST_DEFAULT_NODE_TYPE;
+  self->max_children = GSTD_LIST_DEFAULT_MAX_CHILDREN;
 }
 
 static void
@@ -155,6 +164,11 @@ gstd_list_get_property (GObject * object,
       GST_DEBUG_OBJECT (self, "Returning flags %u", self->flags);
       g_value_set_flags (value, self->flags);
       break;
+    case PROP_MAX_CHILDREN:
+      GST_DEBUG_OBJECT (self, "Returning max children of %u",
+          self->max_children);
+      g_value_set_uint (value, self->max_children);
+      break;
     default:
       /* We don't have any other property... */
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -177,6 +191,13 @@ gstd_list_set_property (GObject * object,
     case PROP_FLAGS:
       GST_DEBUG_OBJECT (self, "Setting node type to %u", self->flags);
       self->flags = g_value_get_flags (value);
+      break;
+    case PROP_MAX_CHILDREN:
+      GST_OBJECT_LOCK (self);
+      self->max_children = g_value_get_uint (value);
+      GST_OBJECT_UNLOCK (self);
+      GST_DEBUG_OBJECT (self, "Setting max children to %u",
+          self->max_children);
       break;
     default:
       /* We don't have any other property... */
@@ -209,6 +230,21 @@ gstd_list_create (GstdObject * object, const gchar * name,
   self = GSTD_LIST (object);
 
   g_return_val_if_fail (object->creator, GSTD_MISSING_INITIALIZATION);
+
+  /* Cheap rejection before constructing the resource. The authoritative
+   * check runs under the lock in gstd_list_append_child; this one exists
+   * to give the client a precise error and to avoid building a resource
+   * that would be thrown away. */
+  GST_OBJECT_LOCK (self);
+  if (self->max_children > 0 && self->count >= self->max_children) {
+    GST_OBJECT_UNLOCK (self);
+    GST_ERROR_OBJECT (object,
+        "Cannot create \"%s\": \"%s\" reached its limit of %u resources",
+        name, GSTD_OBJECT_NAME (self), self->max_children);
+    return GSTD_MAX_LIMIT_REACHED;
+  }
+  GST_OBJECT_UNLOCK (self);
+
   ret = gstd_icreator_create (object->creator, name, description, &out);
   if (ret) {
     goto error;
@@ -372,6 +408,18 @@ gstd_list_append_child (GstdList * self, GstdObject * child)
   if (found) {
     GST_OBJECT_UNLOCK (self);
     goto exists;
+  }
+
+  /* Authoritative capacity check: gstd_list_create pre-checks without
+   * holding the lock across resource construction, so concurrent creates
+   * can race past it and must be rejected here. */
+  if (self->max_children > 0 && self->count >= self->max_children) {
+    GST_OBJECT_UNLOCK (self);
+    GST_ERROR_OBJECT (self,
+        "Cannot append \"%s\": \"%s\" reached its limit of %u resources",
+        GSTD_OBJECT_NAME (child), GSTD_OBJECT_NAME (self),
+        self->max_children);
+    return FALSE;
   }
 
   self->list = g_list_append (self->list, child);

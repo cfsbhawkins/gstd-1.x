@@ -77,6 +77,7 @@ main (gint argc, gchar * argv[])
   gchar *filename = NULL;
   gboolean nolog = FALSE;
   gboolean parent = FALSE;
+  gint max_pipelines = 0;
 
   GstD *gstd = NULL;
 
@@ -105,6 +106,11 @@ main (gint argc, gchar * argv[])
     {"no-log", 'L', 0, G_OPTION_ARG_NONE, &nolog,
           "Disable file logging when gstd is running in daemon mode. Takes precedence over -l and -d.",
         NULL}
+    ,
+    {"max-pipelines", 0, 0, G_OPTION_ARG_INT, &max_pipelines,
+          "Maximum number of simultaneous pipelines, as a resource-exhaustion "
+          "guard (default: unlimited; overrides GSTD_MAX_PIPELINES)",
+        "count"}
     ,
     {NULL}
   };
@@ -183,6 +189,12 @@ main (gint argc, gchar * argv[])
       }
       goto out;
     }
+  }
+
+  if (max_pipelines > 0) {
+    gstd_set_max_pipelines (gstd, (guint) max_pipelines);
+  } else if (max_pipelines < 0) {
+    g_printerr ("Ignoring invalid --max-pipelines %d\n", max_pipelines);
   }
 
   /* Start IPC subsystem */

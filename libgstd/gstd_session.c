@@ -126,6 +126,24 @@ gstd_session_init (GstdSession * self)
   gstd_object_set_deleter (GSTD_OBJECT (self->pipelines),
       g_object_new (GSTD_TYPE_PIPELINE_DELETER, NULL));
 
+  /* Optional cap on simultaneous pipelines, as a resource-exhaustion
+   * guard for the unauthenticated API. The --max-pipelines option
+   * overrides this env var; both default to unlimited. */
+  {
+    const gchar *max_env = g_getenv ("GSTD_MAX_PIPELINES");
+    if (max_env && max_env[0] != '\0') {
+      guint64 max = g_ascii_strtoull (max_env, NULL, 10);
+      if (max > 0 && max <= G_MAXUINT) {
+        g_object_set (self->pipelines, "max-children", (guint) max, NULL);
+        GST_INFO_OBJECT (self, "Limiting pipelines to %u (GSTD_MAX_PIPELINES)",
+            (guint) max);
+      } else {
+        GST_WARNING_OBJECT (self, "Ignoring invalid GSTD_MAX_PIPELINES \"%s\"",
+            max_env);
+      }
+    }
+  }
+
   self->debug =
       GSTD_DEBUG (g_object_new (GSTD_TYPE_DEBUG, "name", "Debug", NULL));
 

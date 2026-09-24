@@ -21,9 +21,10 @@ gstd_LDADD = $(top_builddir)/libgstd/libgstd-1.0.la
 
 noinst_HEADERS = gstd_daemon.h
 
-# Create an open area for our pid and log files
+# Create an open area for our pid and log files. Sticky-bit it (like /tmp)
+# so users cannot delete or replace each other's pid/log/socket files.
 install-data-hook: $(DESTDIR)$(GSTD_RUN_STATE_DIR) $(DESTDIR)$(GSTD_LOG_STATE_DIR)
 
 $(DESTDIR)@GSTD_RUN_STATE_DIR@ $(DESTDIR)@GSTD_LOG_STATE_DIR@:
 	$(MKDIR_P) $@
-	chmod a+w $@
+	chmod 1777 $@
