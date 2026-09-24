@@ -24,7 +24,7 @@
         image: ubuntu:${{ matrix.ubuntu_version }}
 
       steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Dependecies
         run: |
           export DEBIAN_FRONTEND=noninteractive
@@ -70,7 +70,7 @@
         image: ubuntu:${{ matrix.ubuntu_version }}
 
       steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Dependecies
         run: |
           export DEBIAN_FRONTEND=noninteractive
