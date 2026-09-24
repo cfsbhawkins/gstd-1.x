@@ -43,6 +43,11 @@ compile_commands.json
 .DS_Store
 *.registry
 
+# Claude Code: track shared config (.claude/settings.json, CLAUDE.md),
+# ignore local-only overrides
+.claude/settings.local.json
+CLAUDE.local.md
+
 # debian files
 *.deb
 *.build
