@@ -1903,6 +1903,29 @@ gstd_http_init_get_option_group (GstdIpc * base, GOptionGroup ** group)
   return TRUE;
 }
 
+typedef struct _GstdHttpStopData
+{
+  SoupServer *server;
+  GMutex mutex;
+  GCond cond;
+  gboolean done;
+} GstdHttpStopData;
+
+static gboolean
+gstd_http_disconnect_cb (gpointer data)
+{
+  GstdHttpStopData *stop_data = (GstdHttpStopData *) data;
+
+  soup_server_disconnect (stop_data->server);
+
+  g_mutex_lock (&stop_data->mutex);
+  stop_data->done = TRUE;
+  g_cond_signal (&stop_data->cond);
+  g_mutex_unlock (&stop_data->mutex);
+
+  return G_SOURCE_REMOVE;
+}
+
 static GstdReturnCode
 gstd_http_stop (GstdIpc * base)
 {
@@ -1921,9 +1944,30 @@ gstd_http_stop (GstdIpc * base)
   }
 
   if (self->server) {
-    /* Close listeners and any remaining connections before dropping the
-     * reference, so no source can fire against a half-destroyed server */
-    soup_server_disconnect (self->server);
+    GstdHttpStopData stop_data;
+
+    stop_data.server = self->server;
+    stop_data.done = FALSE;
+    g_mutex_init (&stop_data.mutex);
+    g_cond_init (&stop_data.cond);
+
+    /* Disconnect on the context the server dispatches on: closing
+     * listeners and connections from another thread races that
+     * dispatch and triggers GLib criticals. When no loop is running
+     * (daemon shutdown), invoke acquires the context and runs the
+     * callback inline; when a loop thread owns it, the callback is
+     * queued there and we wait for it. */
+    g_main_context_invoke (NULL, gstd_http_disconnect_cb, &stop_data);
+
+    g_mutex_lock (&stop_data.mutex);
+    while (!stop_data.done) {
+      g_cond_wait (&stop_data.cond, &stop_data.mutex);
+    }
+    g_mutex_unlock (&stop_data.mutex);
+
+    g_mutex_clear (&stop_data.mutex);
+    g_cond_clear (&stop_data.cond);
+
     g_object_unref (self->server);
   }
   self->server = NULL;

@@ -48,7 +48,12 @@
       - name: Install
         run: make install
       - name: Check pygstc installation
-        run: python3 -c "import pygstc"
+        # Older distros install to a site-packages dir that is not on the
+        # default sys.path; fall back to locating the installed module.
+        run: |
+          python3 -c "import pygstc" 2>/dev/null || \
+          PYTHONPATH=$(dirname "$(find /usr/local/lib /usr/lib -type d -name pygstc 2>/dev/null | head -n1)") \
+          python3 -c "import pygstc"
       - name: List Pipelines Verification
         run: |
           gstd -e
@@ -94,7 +99,12 @@
       - name: Install
         run: ninja -C build install
       - name: Check pygstc installation
-        run: python3 -c "import pygstc"
+        # Older distros install to a site-packages dir that is not on the
+        # default sys.path; fall back to locating the installed module.
+        run: |
+          python3 -c "import pygstc" 2>/dev/null || \
+          PYTHONPATH=$(dirname "$(find /usr/local/lib /usr/lib -type d -name pygstc 2>/dev/null | head -n1)") \
+          python3 -c "import pygstc"
       - name: List Pipelines Verification
         run: |
           gstd -e
