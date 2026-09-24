@@ -257,8 +257,21 @@ gstd_list_create (GstdObject * object, const gchar * name,
   /* Note: gstd_list_append_child updates count inside its lock,
    * so we don't increment count here to avoid race condition */
   if (!gstd_list_append_child (self, out)) {
+    gboolean at_capacity;
+
+    /* The append fails for a duplicate name or a full list; report the
+     * right error. A concurrent create that raced past the pre-check
+     * above lands here when it loses, and must still surface as a
+     * limit rejection, not "already exists". */
+    GST_OBJECT_LOCK (self);
+    at_capacity = self->max_children > 0
+        && self->count >= self->max_children
+        && NULL == g_list_find_custom (self->list, GSTD_OBJECT_NAME (out),
+        gstd_list_find_node);
+    GST_OBJECT_UNLOCK (self);
+
     g_object_unref (out);
-    ret = GSTD_EXISTING_RESOURCE;
+    ret = at_capacity ? GSTD_MAX_LIMIT_REACHED : GSTD_EXISTING_RESOURCE;
     return ret;
   }
 

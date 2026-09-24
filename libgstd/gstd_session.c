@@ -132,8 +132,10 @@ gstd_session_init (GstdSession * self)
   {
     const gchar *max_env = g_getenv ("GSTD_MAX_PIPELINES");
     if (max_env && max_env[0] != '\0') {
-      guint64 max = g_ascii_strtoull (max_env, NULL, 10);
-      if (max > 0 && max <= G_MAXUINT) {
+      gchar *end = NULL;
+      guint64 max = g_ascii_strtoull (max_env, &end, 10);
+      /* The whole string must be the number: "10abc" is a typo, not 10 */
+      if (end && *end == '\0' && max > 0 && max <= G_MAXUINT) {
         g_object_set (self->pipelines, "max-children", (guint) max, NULL);
         GST_INFO_OBJECT (self, "Limiting pipelines to %u (GSTD_MAX_PIPELINES)",
             (guint) max);

@@ -77,7 +77,7 @@ main (gint argc, gchar * argv[])
   gchar *filename = NULL;
   gboolean nolog = FALSE;
   gboolean parent = FALSE;
-  gint max_pipelines = 0;
+  gint max_pipelines = -1;      /* -1: option absent, keep env/default */
 
   GstD *gstd = NULL;
 
@@ -109,7 +109,8 @@ main (gint argc, gchar * argv[])
     ,
     {"max-pipelines", 0, 0, G_OPTION_ARG_INT, &max_pipelines,
           "Maximum number of simultaneous pipelines, as a resource-exhaustion "
-          "guard (default: unlimited; overrides GSTD_MAX_PIPELINES)",
+          "guard. 0 means unlimited (default; overrides GSTD_MAX_PIPELINES, "
+          "so an explicit 0 clears an environment-applied cap)",
         "count"}
     ,
     {NULL}
@@ -191,9 +192,10 @@ main (gint argc, gchar * argv[])
     }
   }
 
-  if (max_pipelines > 0) {
+  /* 0 is meaningful: it clears a cap applied via GSTD_MAX_PIPELINES */
+  if (max_pipelines >= 0) {
     gstd_set_max_pipelines (gstd, (guint) max_pipelines);
-  } else if (max_pipelines < 0) {
+  } else if (max_pipelines < -1) {
     g_printerr ("Ignoring invalid --max-pipelines %d\n", max_pipelines);
   }
 

@@ -150,10 +150,13 @@ gstd_socket_callback (GSocketService * service,
       break;
     }
     message[read] = '\0';
-    /* Tolerate line-oriented clients (telnet, netcat): the command
-     * language never ends in whitespace, so trailing CR/LF is framing,
-     * not content, and would otherwise be parsed into the last token. */
-    g_strchomp (message);
+    /* Tolerate line-oriented clients (telnet, netcat): strip trailing
+     * CR/LF, which is framing, not content. Only CR/LF — a property
+     * value or description may legitimately end in spaces or tabs. */
+    while (read > 0
+        && (message[read - 1] == '\n' || message[read - 1] == '\r')) {
+      message[--read] = '\0';
+    }
     command_count++;
 
     GST_DEBUG_OBJECT (session, "Received command from %s: %.80s%s",

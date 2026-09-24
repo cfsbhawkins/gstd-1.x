@@ -36,6 +36,7 @@
 #include "gstd_session.h"
 #include "gstd_http.h"
 #include "gstd_ipc.h"
+#include "gstd_list.h"
 
 #define TEST_HTTP_PORT 15000
 #define TEST_HTTP_ADDRESS "127.0.0.1"
@@ -55,6 +56,12 @@ main_loop_thread_func (gpointer data)
 static void
 setup (void)
 {
+  /* The daemon reads these as fallbacks; a developer shell exporting
+   * them must not change what these tests observe */
+  g_unsetenv ("GSTD_HTTP_API_TOKEN");
+  g_unsetenv ("GSTD_HTTP_CORS_ORIGIN");
+  g_unsetenv ("GSTD_MAX_PIPELINES");
+
   test_session = gstd_session_new ("HTTP Test Session");
   fail_if (NULL == test_session);
 
@@ -534,6 +541,145 @@ GST_START_TEST (test_http_rejects_name_with_whitespace)
 }
 GST_END_TEST;
 
+/*
+ * Test: OPTIONS never reaches state-disclosing handlers, so a CORS
+ * preflight on /pipelines/status cannot bypass a configured token
+ */
+GST_START_TEST (test_http_options_does_not_leak_status)
+{
+  GstdReturnCode ret;
+  GstdObject *node;
+  gchar *response;
+  guint status_code;
+
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  /* Create a pipeline whose name must not appear in any OPTIONS body */
+  ret = gstd_get_by_uri (test_session, "/pipelines", &node);
+  fail_if (ret != GSTD_EOK);
+  ret = gstd_object_create (node, "secret_pipe", "fakesrc ! fakesink");
+  fail_if (ret != GSTD_EOK);
+  gst_object_unref (node);
+
+  g_usleep (100000);
+
+  response = http_request ("OPTIONS", "/pipelines/status", NULL,
+      &status_code, NULL);
+  fail_if (status_code != 200,
+      "OPTIONS preflight returned %u, expected 200", status_code);
+  fail_if (response == NULL);
+  fail_if (strstr (response, "secret_pipe") != NULL,
+      "OPTIONS response must not contain pipeline names");
+  fail_if (strstr (response, "pipelines") != NULL,
+      "OPTIONS response must not contain pipeline state JSON");
+  g_free (response);
+
+  /* Non-GET methods on the status endpoint are rejected even when
+   * authenticated (unauthenticated ones already get 401 first) */
+  response = http_request ("POST", "/pipelines/status",
+      "Authorization: Bearer test-secret-token", &status_code, NULL);
+  fail_if (status_code != 405,
+      "POST /pipelines/status returned %u, expected 405", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: exceeding the pipeline cap over HTTP returns 429
+ */
+GST_START_TEST (test_http_pipeline_cap_returns_429)
+{
+  GstdReturnCode ret;
+  GstdList *pipelines = NULL;
+  gchar *response;
+  guint status_code;
+
+  g_object_get (test_session, "pipelines", &pipelines, NULL);
+  fail_if (NULL == pipelines);
+  g_object_set (pipelines, "max-children", 1, NULL);
+  g_object_unref (pipelines);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("POST",
+      "/pipelines?name=first&description=fakesrc%20!%20fakesink",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 200,
+      "First create returned %u, expected 200", status_code);
+  g_free (response);
+
+  response = http_request ("POST",
+      "/pipelines?name=second&description=fakesrc%20!%20fakesink",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 429,
+      "Create past the cap returned %u, expected 429", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: encoded whitespace in the request path is rejected, since the
+ * decoded path is spliced into the same parser command as the name
+ */
+GST_START_TEST (test_http_rejects_path_with_whitespace)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("POST",
+      "/pipelines%20other?name=safe&description=fakesrc",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 400,
+      "POST with whitespace in path returned %u, expected 400", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: a 401 carries CORS headers when an origin is configured, so a
+ * browser page sees the auth failure instead of a network error
+ */
+GST_START_TEST (test_http_unauthorized_carries_cors)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  gchar *raw = NULL;
+  guint status_code;
+
+  g_object_set (test_http,
+      "api-token", "test-secret-token",
+      "cors-origin", "http://example.com", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("GET", "/pipelines", NULL, &status_code, &raw);
+  fail_if (status_code != 401,
+      "Request without token returned %u, expected 401", status_code);
+  fail_if (raw == NULL);
+  fail_if (strstr (raw,
+          "Access-Control-Allow-Origin: http://example.com") == NULL,
+      "401 should carry the configured CORS origin");
+
+  g_free (response);
+  g_free (raw);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -556,6 +702,10 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_cors_origin_configured);
   tcase_add_test (tc, test_http_api_token);
   tcase_add_test (tc, test_http_rejects_name_with_whitespace);
+  tcase_add_test (tc, test_http_options_does_not_leak_status);
+  tcase_add_test (tc, test_http_pipeline_cap_returns_429);
+  tcase_add_test (tc, test_http_rejects_path_with_whitespace);
+  tcase_add_test (tc, test_http_unauthorized_carries_cors);
 
   return suite;
 }

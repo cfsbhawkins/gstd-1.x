@@ -134,6 +134,10 @@ gstd_pipeline_limit_suite (void)
   Suite *suite = suite_create ("gstd_pipeline_limit");
   TCase *tc = tcase_create ("general");
 
+  /* gstd_session_init applies this env var; a developer shell exporting
+   * it must not change what these tests observe */
+  g_unsetenv ("GSTD_MAX_PIPELINES");
+
   suite_add_tcase (suite, tc);
   tcase_set_timeout (tc, 30);
 

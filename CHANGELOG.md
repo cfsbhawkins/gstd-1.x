@@ -11,22 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Opt-in HTTP API token authentication** (`gstd_http.c`)
   - `--http-api-token <token>` or `GSTD_HTTP_API_TOKEN` (preferred; command
     lines are visible to other local processes). When configured, every HTTP
-    request except `GET /health` and CORS preflights must carry
-    `Authorization: Bearer <token>`; failures get `401` with
-    `WWW-Authenticate: Bearer`. Token comparison is timing-safe
-    (SHA-256 digest equality). Default: disabled, matching upstream.
+    request except `GET /health` must carry `Authorization: Bearer <token>`;
+    failures get `401` with `WWW-Authenticate: Bearer` (and CORS headers when
+    an origin is configured, so browser pages see the 401 rather than an
+    opaque network error). Token comparison hashes both sides and compares
+    the digests without an early exit; oversized `Authorization` values are
+    rejected before hashing. Default: disabled, matching upstream.
+  - `OPTIONS` requests are answered centrally with an empty preflight
+    response before any handler runs, so a preflight can neither bypass the
+    token nor reach a state-disclosing endpoint such as `/pipelines/status`
+    (which is now also `GET`-only). The token and CORS origin are swapped
+    and read under a lock, so runtime rotation through the GObject
+    properties is safe.
 - **Pipeline count limit** (`gstd_list.c`, `libgstd.c`, `gstd.c`)
   - `--max-pipelines <count>` or `GSTD_MAX_PIPELINES` caps simultaneous
     pipelines as a resource-exhaustion guard for the unauthenticated API.
     Backed by a new `GstdList` `max-children` property (0 = unlimited,
     enforced under the list lock) and a new `GSTD_MAX_LIMIT_REACHED`
-    return code, mapped to HTTP 429.
+    return code, mapped to HTTP 429 — including for concurrent creates
+    that lose the race on the locked append path. An explicit
+    `--max-pipelines 0` clears a cap applied via the environment, and the
+    env value must be entirely numeric.
   - New public API `gstd_set_max_pipelines()`.
 - **GObject properties on `GstdHttp`** — `port`, `address`, `max-threads`,
   `api-token`, `cors-origin` — so embedders and tests can configure the
   server without the option group.
 - Tests: `test_gstd_pipeline_limit.c` (cap enforce/release/disable) and
-  new HTTP tests for token auth, CORS defaults, and name validation.
+  new HTTP tests for token auth, CORS defaults, name and path validation,
+  OPTIONS non-disclosure, HTTP 429 on the cap, and CORS on 401. Fixtures
+  unset `GSTD_MAX_PIPELINES`, `GSTD_HTTP_API_TOKEN`, and
+  `GSTD_HTTP_CORS_ORIGIN` so an exporting shell cannot skew results.
   `test_gstd_http.c` existed but was never registered with any build
   system and could not have passed (no main loop, wrong assertions,
   properties that did not exist); it is now fixed and wired into meson
@@ -40,23 +54,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--http-cors-origin <origin>` / `GSTD_HTTP_CORS_ORIGIN` is set; a
   non-wildcard origin also gets `Vary: Origin`, and
   `authorization` was added to `Access-Control-Allow-Headers`.
-- **Runtime/log directories install as 1777 instead of 777**
-  (`gstd/meson.build`, `gstd/Makefile.am`) — the sticky bit (like `/tmp`)
-  stops local users deleting or replacing each other's pid, socket, and
-  log files while still letting any user run gstd. Deployments with a
+- **Runtime/log directories are created as 1777 instead of 777**
+  (`gstd/meson.build`, `gstd/Makefile.am`, `init/gstd.in`) — the sticky
+  bit (like `/tmp`) stops local users deleting or replacing each other's
+  pid, socket, and log files while still letting any user run gstd. The
+  sysv init script also re-applies the mode on every start so a
+  pre-existing weaker directory gets corrected. Deployments with a
   dedicated gstd user should tighten to 0750.
-- **HTTP `?name=` values are validated** (`gstd_http.c`) — names with
-  whitespace or control characters were re-tokenized by the internal
-  space-separated command parser into extra arguments; POST and DELETE
-  now reject them with `400`. PUT is unaffected since its `name` carries
-  property values, where spaces are legitimate.
+- **HTTP `?name=` values and request paths are validated** (`gstd_http.c`)
+  — names or percent-decoded paths with whitespace or control characters
+  were re-tokenized by the internal space-separated command parser into
+  extra arguments (e.g. `POST /pipelines%20other?name=safe`); both are now
+  rejected with `400`. PUT's `name` is exempt since it carries property
+  values, where spaces are legitimate.
 - **`GSTD_BAD_VALUE` now maps to HTTP 400** instead of `204 No Content`,
   which mislabeled a client error as success.
 - **TCP commands tolerate trailing CR/LF** (`gstd_socket.c`) so
   line-oriented clients (telnet, netcat) don't leak framing bytes into
-  the last token. Real message framing remains one command per `read()`:
-  the client protocol sends no delimiter, so this cannot be fixed
-  without a protocol change.
+  the last token. Only CR/LF is stripped — property values may
+  legitimately end in spaces or tabs. Real message framing remains one
+  command per `read()`: the client protocol sends no delimiter, so this
+  cannot be fixed without a protocol change.
 
 ## [0.16.2] - 2026-05-21
 

@@ -218,12 +218,17 @@ gstd_http_set_property (GObject * object, guint property_id,
       self->max_threads = g_value_get_int (value);
       break;
     case PROP_API_TOKEN:
+      /* Swapped under the lock: soup threads read it per request */
+      g_mutex_lock (&self->mutex);
       g_free (self->api_token);
       self->api_token = g_value_dup_string (value);
+      g_mutex_unlock (&self->mutex);
       break;
     case PROP_CORS_ORIGIN:
+      g_mutex_lock (&self->mutex);
       g_free (self->cors_origin);
       self->cors_origin = g_value_dup_string (value);
+      g_mutex_unlock (&self->mutex);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -248,10 +253,14 @@ gstd_http_get_property (GObject * object, guint property_id,
       g_value_set_int (value, self->max_threads);
       break;
     case PROP_API_TOKEN:
+      g_mutex_lock (&self->mutex);
       g_value_set_string (value, self->api_token);
+      g_mutex_unlock (&self->mutex);
       break;
     case PROP_CORS_ORIGIN:
+      g_mutex_lock (&self->mutex);
       g_value_set_string (value, self->cors_origin);
+      g_mutex_unlock (&self->mutex);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -311,67 +320,95 @@ get_status_code (GstdReturnCode ret)
     /* 429 Too Many Requests; not all libsoup versions name it */
     status = (SoupStatus) 429;
   } else {
-    /* Including GSTD_BAD_VALUE: a rejected value is a client error, not
-     * a 204 No Content success as previously mapped. */
+    /* Including GSTD_BAD_VALUE: a rejected value is a client error */
     status = SOUP_STATUS_BAD_REQUEST;
   }
 
   return status;
 }
 
+/* Refuse to hash absurdly long credentials */
+#define GSTD_HTTP_MAX_TOKEN_LENGTH 1024
+
 /*
  * Append CORS headers only when an allowed origin was configured.
  * With no origin configured (the default) no CORS headers are emitted,
  * so browsers refuse cross-origin access to the API.
+ * The origin is copied under the lock: it may be swapped through the
+ * GObject property while soup threads are serving requests.
  */
 static void
 add_cors_headers (GstdHttp * self, SoupMessageHeaders * response_headers,
     const gchar * methods)
 {
-  if (!self || !self->cors_origin || self->cors_origin[0] == '\0') {
+  gchar *origin = NULL;
+
+  if (!self) {
+    return;
+  }
+
+  g_mutex_lock (&self->mutex);
+  origin = g_strdup (self->cors_origin);
+  g_mutex_unlock (&self->mutex);
+
+  if (!origin || origin[0] == '\0') {
+    g_free (origin);
     return;
   }
 
   soup_message_headers_append (response_headers,
-      "Access-Control-Allow-Origin", self->cors_origin);
+      "Access-Control-Allow-Origin", origin);
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Headers",
       "origin,range,content-type,authorization");
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Methods", methods);
-  if (g_strcmp0 (self->cors_origin, "*") != 0) {
+  if (g_strcmp0 (origin, "*") != 0) {
     soup_message_headers_append (response_headers, "Vary", "Origin");
   }
+
+  g_free (origin);
 }
 
 /*
- * Compare secrets without an early exit on the first differing byte.
- * Comparing SHA-256 digests keeps the timing independent of how much
- * of the attempt matches the real token.
+ * Compare secrets in time independent of where they first differ.
+ * Both inputs are hashed so the comparison runs over fixed-length
+ * digests, and the digests are compared without an early exit; a
+ * matching digest prefix reveals nothing about the token itself.
  */
 static gboolean
 token_equal (const gchar * expected, const gchar * provided)
 {
   gchar *expected_digest = NULL;
   gchar *provided_digest = NULL;
-  gboolean equal = FALSE;
+  guchar diff = 0;
+  gsize i;
 
   expected_digest =
       g_compute_checksum_for_string (G_CHECKSUM_SHA256, expected, -1);
   provided_digest =
       g_compute_checksum_for_string (G_CHECKSUM_SHA256, provided, -1);
 
-  equal = (g_strcmp0 (expected_digest, provided_digest) == 0);
+  if (!expected_digest || !provided_digest
+      || strlen (expected_digest) != strlen (provided_digest)) {
+    diff = 1;
+  } else {
+    for (i = 0; expected_digest[i] != '\0'; i++) {
+      diff |= (guchar) expected_digest[i] ^ (guchar) provided_digest[i];
+    }
+  }
 
   g_free (expected_digest);
   g_free (provided_digest);
 
-  return equal;
+  return diff == 0;
 }
 
 /*
  * Validate the Authorization header against the configured API token.
  * Returns TRUE when no token is configured (authentication disabled).
+ * The token is copied under the lock: it may be swapped through the
+ * GObject property while soup threads are serving requests.
  */
 static gboolean
 request_authorized (GstdHttp * self, SoupMsg * msg)
@@ -379,8 +416,15 @@ request_authorized (GstdHttp * self, SoupMsg * msg)
   SoupMessageHeaders *request_headers = NULL;
   const gchar *authorization = NULL;
   static const gchar bearer_prefix[] = "Bearer ";
+  gchar *token = NULL;
+  gboolean authorized = FALSE;
 
-  if (!self->api_token || self->api_token[0] == '\0') {
+  g_mutex_lock (&self->mutex);
+  token = g_strdup (self->api_token);
+  g_mutex_unlock (&self->mutex);
+
+  if (!token || token[0] == '\0') {
+    g_free (token);
     return TRUE;
   }
 #if SOUP_CHECK_VERSION(3,0,0)
@@ -389,22 +433,26 @@ request_authorized (GstdHttp * self, SoupMsg * msg)
   request_headers = msg->request_headers;
 #endif
   if (!request_headers) {
-    return FALSE;
+    goto out;
   }
 
   authorization = soup_message_headers_get_one (request_headers,
       "Authorization");
-  if (!authorization) {
-    return FALSE;
+  if (!authorization
+      || strlen (authorization) > GSTD_HTTP_MAX_TOKEN_LENGTH) {
+    goto out;
   }
 
   if (g_ascii_strncasecmp (authorization, bearer_prefix,
           strlen (bearer_prefix)) != 0) {
-    return FALSE;
+    goto out;
   }
 
-  return token_equal (self->api_token,
-      authorization + strlen (bearer_prefix));
+  authorized = token_equal (token, authorization + strlen (bearer_prefix));
+
+out:
+  g_free (token);
+  return authorized;
 }
 
 static void
@@ -422,6 +470,9 @@ respond_unauthorized (GstdHttp * self, SoupMsg * msg)
 #endif
   soup_message_headers_append (response_headers, "WWW-Authenticate",
       "Bearer");
+  /* With CORS configured, let the browser page read the 401 rather than
+   * see an opaque network error */
+  add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json",
@@ -1516,16 +1567,71 @@ server_callback (SoupServer * server, SoupMessage * msg,
   method = msg->method;
 #endif
 
-  /* When an API token is configured, every other endpoint requires it.
-   * OPTIONS stays exempt: CORS preflights carry no credentials. */
-  if (method != SOUP_METHOD_OPTIONS && !request_authorized (self, msg)) {
+  /* Answer CORS preflights centrally, before authentication (preflights
+   * carry no credentials) and before any handler could run: an OPTIONS
+   * request must never reach code that discloses state. */
+  if (method == SOUP_METHOD_OPTIONS) {
+#if SOUP_CHECK_VERSION(3,0,0)
+    response_headers = soup_server_message_get_response_headers (msg);
+#else
+    response_headers = msg->response_headers;
+#endif
+    add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_status (msg, SOUP_STATUS_OK, NULL);
+#else
+    soup_message_set_status (msg, SOUP_STATUS_OK);
+#endif
+    return;
+  }
+
+  /* When an API token is configured, every other endpoint requires it. */
+  if (!request_authorized (self, msg)) {
     respond_unauthorized (self, msg);
+    return;
+  }
+
+  /* The decoded request path is spliced into the same space-separated
+   * parser command as ?name=, so whitespace or control characters in it
+   * (e.g. an encoded %20) would be re-tokenized as extra command
+   * arguments. Legitimate gstd paths never contain them. */
+  if (!is_valid_resource_name (path)) {
+    static const char *bad_path =
+        "{ \"code\": 1, \"description\": \"Invalid characters in request"
+        " path\", \"response\": null }";
+#if SOUP_CHECK_VERSION(3,0,0)
+    soup_server_message_set_response (msg, "application/json",
+        SOUP_MEMORY_STATIC, bad_path, strlen (bad_path));
+    soup_server_message_set_status (msg, SOUP_STATUS_BAD_REQUEST, NULL);
+#else
+    soup_message_set_response (msg, "application/json",
+        SOUP_MEMORY_STATIC, bad_path, strlen (bad_path));
+    soup_message_set_status (msg, SOUP_STATUS_BAD_REQUEST);
+#endif
     return;
   }
 
   /* Fast path for pipeline status polling - bypass thread pool.
    * This endpoint is optimized for frequent monitoring requests. */
   if (g_strcmp0 (path, "/pipelines/status") == 0) {
+    if (method != SOUP_METHOD_GET) {
+      static const char *status_method_error =
+          "{ \"code\": 1, \"description\": \"Method not allowed:"
+          " use GET\", \"response\": null }";
+#if SOUP_CHECK_VERSION(3,0,0)
+      soup_server_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, status_method_error,
+          strlen (status_method_error));
+      soup_server_message_set_status (msg,
+          SOUP_STATUS_METHOD_NOT_ALLOWED, NULL);
+#else
+      soup_message_set_response (msg, "application/json",
+          SOUP_MEMORY_STATIC, status_method_error,
+          strlen (status_method_error));
+      soup_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+#endif
+      return;
+    }
     handle_pipelines_status (self, server, msg, session);
     return;
   }
@@ -1678,6 +1784,7 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   /* Environment fallbacks for settings not given on the command line.
    * The env var is the recommended way to pass the token, since command
    * line arguments are visible to other local processes. */
+  g_mutex_lock (&self->mutex);
   if (NULL == self->api_token) {
     self->api_token = g_strdup (g_getenv ("GSTD_HTTP_API_TOKEN"));
   }
@@ -1687,6 +1794,7 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (self->api_token) {
     GST_INFO_OBJECT (self, "HTTP API token authentication enabled");
   }
+  g_mutex_unlock (&self->mutex);
 
   self->session = session;
   gstd_http_stop (base);

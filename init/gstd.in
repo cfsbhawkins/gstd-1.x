@@ -20,6 +20,14 @@ manage_dir()
         exit 1
     fi
 
+    #mkdir -m leaves an existing directory's mode alone; enforce it so a
+    #pre-existing state dir cannot keep a weaker mode
+    chmod "$mode" "$dir";
+    if [ $? -ne 0 ]; then
+        echo "GstD init: Error, cannot set mode $mode on $dir" 1>&2;
+        exit 1
+    fi
+
     #Set the owner
     chown -R "$user" "$dir";
     if [ $? -ne 0 ]; then
@@ -34,9 +42,11 @@ gstdlogstatedir=@GSTD_LOG_STATE_DIR@
 
 case "$1" in
     start)
-        #Manage pid and log directories
-        manage_dir "$gstdrunstatedir" 777 @GSTD_STATE_DIRS_OWNER@
-        manage_dir "$gstdlogstatedir" 777 @GSTD_STATE_DIRS_OWNER@
+        #Manage pid and log directories. 1777 (sticky, like /tmp) matches
+        #the install hooks: users cannot delete or replace each other's
+        #pid/socket/log files.
+        manage_dir "$gstdrunstatedir" 1777 @GSTD_STATE_DIRS_OWNER@
+        manage_dir "$gstdlogstatedir" 1777 @GSTD_STATE_DIRS_OWNER@
 
         #Start gstd
         @prefix@/bin/gstd -e;
