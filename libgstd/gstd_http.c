@@ -407,6 +407,7 @@ do_request (gpointer data_request, gpointer eval)
   if (query != NULL) {
     g_hash_table_unref (query);
   }
+  g_object_unref (msg);
   g_free (data_request);
   data_request = NULL;
 
@@ -1322,7 +1323,11 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
   data_request = g_new0 (GstdHttpRequest, 1);
 
-  data_request->msg = msg;
+  /* The worker thread completes this message after the pause below,
+   * possibly long after libsoup would have dropped its own references
+   * on a client disconnect. Hold a reference until the worker is done;
+   * it also keeps `path` valid, which is owned by the message's URI. */
+  data_request->msg = g_object_ref (msg);
   data_request->server = server;
   data_request->session = session;
   data_request->path = path;
@@ -1358,6 +1363,7 @@ server_callback (SoupServer * server, SoupMessage * msg,
     if (data_request->query) {
       g_hash_table_unref (data_request->query);
     }
+    g_object_unref (data_request->msg);
     g_free (data_request);
     /* Unpause the message so libsoup can complete it with an error */
     g_mutex_lock (&self->mutex);
