@@ -939,6 +939,7 @@ handle_pipelines_status (GstdHttp * self, SoupServer * server,
     const gchar *name;
     gchar *escaped_name;
     GstState current_state = GST_STATE_NULL;
+    GstElement *element;
 
     name = GSTD_OBJECT_NAME (pipeline);
 
@@ -948,7 +949,7 @@ handle_pipelines_status (GstdHttp * self, SoupServer * server,
      * Since this endpoint runs on the soup main thread, any blocking here
      * stalls all HTTP I/O. Use GST_STATE() for a lock-free read of the
      * last-known state instead. */
-    GstElement *element = gstd_pipeline_get_element (pipeline);
+    element = gstd_pipeline_get_element (pipeline);
     if (element) {
       gst_object_ref (element);
       current_state = GST_STATE (element);
@@ -1920,6 +1921,9 @@ gstd_http_stop (GstdIpc * base)
   }
 
   if (self->server) {
+    /* Close listeners and any remaining connections before dropping the
+     * reference, so no source can fire against a half-destroyed server */
+    soup_server_disconnect (self->server);
     g_object_unref (self->server);
   }
   self->server = NULL;

@@ -161,7 +161,6 @@ GST_END_TEST;
 GST_START_TEST (test_pipeline_refcount_balance)
 {
   GstdObject *node;
-  GstdObject *state_node;
   GstdReturnCode ret;
   GstdSession *test_session = gstd_session_new ("Test Session");
   int i;

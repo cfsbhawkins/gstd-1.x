@@ -30,6 +30,8 @@
 #  include "config.h"
 #endif
 
+#include <stdio.h>
+
 #include <gst/check/gstcheck.h>
 #include <gio/gio.h>
 
@@ -90,17 +92,20 @@ setup (void)
 static void
 teardown (void)
 {
-  if (test_http) {
-    gstd_ipc_stop (GSTD_IPC (test_http));
-    g_object_unref (test_http);
-    test_http = NULL;
-  }
+  /* Stop dispatching before destroying the server: tearing the soup
+   * server down while the loop thread is mid-dispatch on one of its
+   * sources races and triggers GLib criticals under load */
   if (test_loop) {
     g_main_loop_quit (test_loop);
     g_thread_join (test_loop_thread);
     g_main_loop_unref (test_loop);
     test_loop = NULL;
     test_loop_thread = NULL;
+  }
+  if (test_http) {
+    gstd_ipc_stop (GSTD_IPC (test_http));
+    g_object_unref (test_http);
+    test_http = NULL;
   }
   if (test_session) {
     g_object_unref (test_session);

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **CI breakage** across the workflow matrix:
+  - `gstd_action.c` / `gstd_http.c` mixed declarations failed
+    `meson --werror` (`-Wdeclaration-after-statement`); an unused variable
+    in `test_gstd_refcount.c` would have been next. The meson jobs had
+    been red since the code-audit commit.
+  - `tests/gstd/Makefile.am` now links `$(GIO_LIBS)`: registering
+    `test_gstd_http` exposed that the autotools test harness never linked
+    GIO (`g_socket_client_new` undefined at link).
+  - `test_gstd_http.c` includes `<stdio.h>` for `sscanf` (Ubuntu 20.04's
+    glibc headers don't pull it in transitively).
+- **HTTP shutdown race**: `gstd_http_stop` now calls
+  `soup_server_disconnect()` before dropping the server reference, and the
+  HTTP test teardown stops its main-loop thread before destroying the
+  server. Destroying the soup server concurrently with source dispatch
+  raced and produced GLib criticals, seen as flaky failures in the ASan
+  workflow.
+
 ### Added
 - **Opt-in HTTP API token authentication** (`gstd_http.c`)
   - `--http-api-token <token>` or `GSTD_HTTP_API_TOKEN` (preferred; command

@@ -213,6 +213,8 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
   GValue ret_sig = G_VALUE_INIT;
   GValue *args = NULL;
   gchar **arg_list = NULL;
+  /* Number of initialized GValues, for proper cleanup */
+  guint initialized_count = 0;
 
   GST_INFO_OBJECT (action, "Action create");
 
@@ -248,9 +250,6 @@ gstd_action_create_default (GstdObject * object, const gchar * name,
 
   /* One additional value to store the instance as first value */
   args = g_new0 (GValue, query.n_params + 1);
-
-  /* Track number of initialized GValues for proper cleanup */
-  guint initialized_count = 0;
 
   g_value_init (&args[0], G_TYPE_OBJECT);
   g_value_set_object (&args[0], action->target);
