@@ -77,30 +77,28 @@ gstd_unix_class_init (GstdUnixClass * klass)
       "Gstd UNIX category");
 }
 
-static void
-gstd_unix_set_path (GstdUnix * self, const gchar * path)
+/* The path stays NULL until first use so that a --unix-base-path option,
+ * which overwrites the pointer without freeing it, does not leak a
+ * preallocated default. */
+static const gchar *
+gstd_unix_get_path (GstdUnix * self)
 {
-  g_free (self->unix_path);
+  if (NULL == self->unix_path) {
+    self->unix_path =
+        g_strdup_printf ("%s/%s", GSTD_RUN_STATE_DIR,
+        GSTD_UNIX_DEFAULT_BASE_NAME);
+  }
 
-  if (path != NULL)
-    self->unix_path = g_strdup (path);
-  else
-    self->unix_path = NULL;
+  return self->unix_path;
 }
 
 static void
 gstd_unix_init (GstdUnix * self)
 {
-  gchar *default_path;
   GST_INFO_OBJECT (self, "Initializing gstd Unix");
 
-  default_path =
-      g_strdup_printf ("%s/%s", GSTD_RUN_STATE_DIR,
-      GSTD_UNIX_DEFAULT_BASE_NAME);
-  gstd_unix_set_path (self, default_path);
-  g_free (default_path);
+  self->unix_path = NULL;
   self->num_ports = GSTD_UNIX_DEFAULT_NUM_PORTS;
-
 }
 
 static void
@@ -114,7 +112,7 @@ gstd_unix_dispose (GObject * object)
 
   if (parent->enabled) {
     for (i = 0; i < self->num_ports; i++) {
-      gchar *path_name = g_strdup_printf ("%s_%d", self->unix_path, i);
+      gchar *path_name = g_strdup_printf ("%s_%d", gstd_unix_get_path (self), i);
 
       if (unlink (path_name) != 0) {
         GST_ERROR_OBJECT (object, "Unable to delete UNIX path (%s)",
@@ -137,7 +135,7 @@ gstd_unix_create_socket_service (GstdSocket * base, GSocketService ** service)
 {
   GError *error = NULL;
   GstdUnix *self = GSTD_UNIX (base);
-  gchar *path = self->unix_path;
+  const gchar *path = gstd_unix_get_path (self);
   guint i;
 
   GST_DEBUG_OBJECT (self, "Getting UNIX Socket address");

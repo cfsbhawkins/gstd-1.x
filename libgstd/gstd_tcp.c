@@ -92,7 +92,9 @@ gstd_tcp_init (GstdTcp * self)
 {
   GST_INFO_OBJECT (self, "Initializing gstd Tcp");
   self->base_port = GSTD_TCP_DEFAULT_PORT;
-  self->address = g_strdup (GSTD_TCP_DEFAULT_ADDRESS);
+  /* Left NULL until first use: the --tcp-address option overwrites the
+   * pointer without freeing it, so a preallocated default would leak. */
+  self->address = NULL;
   self->num_ports = GSTD_TCP_DEFAULT_NUM_PORTS;
   self->max_threads = GSTD_TCP_DEFAULT_MAX_THREADS;
 }
@@ -116,16 +118,19 @@ gstd_tcp_create_socket_service (GstdSocket * base, GSocketService ** service)
   GError *error = NULL;
   GstdTcp *self = GSTD_TCP (base);
   guint16 port = self->base_port;
-  gchar *address = self->address;
+  gchar *address;
   guint i;
 
   GST_DEBUG_OBJECT (self, "Getting TCP Socket address");
 
+  if (NULL == self->address)
+    self->address = g_strdup (GSTD_TCP_DEFAULT_ADDRESS);
+  address = self->address;
+
   *service = g_threaded_socket_service_new (self->max_threads);
 
   for (i = 0; i < self->num_ports; i++) {
-    gstd_tcp_add_listeners (*service, address, port + i, &error);
-    if (error)
+    if (!gstd_tcp_add_listeners (*service, address, port + i, &error))
       goto noconnection;
   }
 
@@ -133,9 +138,10 @@ gstd_tcp_create_socket_service (GstdSocket * base, GSocketService ** service)
 
 noconnection:
   {
-    GST_ERROR_OBJECT (self, "%s", error->message);
-    g_printerr ("%s\n", error->message);
-    g_error_free (error);
+    const gchar *message = error ? error->message : "Unable to add listener";
+    GST_ERROR_OBJECT (self, "%s", message);
+    g_printerr ("%s\n", message);
+    g_clear_error (&error);
     g_socket_service_stop (*service);
     g_object_unref (*service);
     *service = NULL;
@@ -190,6 +196,11 @@ gstd_tcp_add_listeners (GSocketService * service, gchar * address, gint port,
   g_return_val_if_fail (error != NULL, FALSE);
 
   sa = g_inet_socket_address_new_from_string (address, port);
+  if (NULL == sa) {
+    g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+        "Invalid TCP address \"%s\"", address);
+    return FALSE;
+  }
 
   if (g_socket_listener_add_address (G_SOCKET_LISTENER (service), sa,
           G_SOCKET_TYPE_STREAM, G_SOCKET_PROTOCOL_TCP, NULL, NULL, error)

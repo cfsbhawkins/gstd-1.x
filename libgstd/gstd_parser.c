@@ -196,7 +196,9 @@ gstd_parser_parse_raw_cmd (GstdSession * session, gchar * action, gchar * args,
 
   tokens = g_strsplit (args, " ", 2);
   uri = tokens[0];
-  rest = tokens[1];
+  /* An empty args string splits into an empty vector: tokens[0] is the
+   * NULL terminator and tokens[1] would read past the allocation. */
+  rest = uri ? tokens[1] : NULL;
 
   // Alias the empty string to the base
   if (!uri)
@@ -244,6 +246,13 @@ gstd_parser_parse_cmd (GstdSession * session, const gchar * cmd,
 
   tokens = g_strsplit (cmd, " ", 2);
   action = tokens[0];
+  /* An empty command splits into an empty vector: tokens[0] is the NULL
+   * terminator and tokens[1] would read past the allocation. */
+  if (NULL == action) {
+    GST_ERROR_OBJECT (session, "Empty command");
+    g_strfreev (tokens);
+    return GSTD_BAD_COMMAND;
+  }
   args = tokens[1];
 
   cb = cmds;
@@ -275,7 +284,7 @@ gstd_parser_create (GstdSession * session, GstdObject * obj, gchar * args,
   gchar **tokens = NULL;
   gchar *name;
   gchar *description;
-  GstdObject *new;
+  GstdObject *new = NULL;
   GstdReturnCode ret;
 
   g_return_val_if_fail (GSTD_IS_SESSION (session), GSTD_NULL_ARGUMENT);
@@ -291,19 +300,18 @@ gstd_parser_create (GstdSession * session, GstdObject * obj, gchar * args,
   } else {
     tokens = g_strsplit (args, " ", 2);
     name = tokens[0];
-    description = tokens[1];
-  }
-
-  if (NULL == name) {
-    /* No name provided, hence no desciption either, but it may contain garbage */
-    description = NULL;
+    /* An empty args string splits into an empty vector: tokens[0] is
+     * the NULL terminator and tokens[1] would read past the allocation. */
+    description = name ? tokens[1] : NULL;
   }
 
   ret = gstd_object_create (obj, name, description);
   if (ret)
     goto out;
 
-  gstd_object_read (obj, name, &new);
+  if (gstd_object_read (obj, name, &new) != GSTD_EOK) {
+    goto out;
+  }
   if (NULL != new) {
     gstd_object_to_string (new, response);
     g_object_unref (new);

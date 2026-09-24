@@ -134,7 +134,9 @@ gstd_http_init (GstdHttp * self)
   GST_INFO_OBJECT (self, "Initializing gstd Http");
   g_mutex_init (&self->mutex);
   self->port = GSTD_HTTP_DEFAULT_PORT;
-  self->address = g_strdup (GSTD_HTTP_DEFAULT_ADDRESS);
+  /* Left NULL until first use: the --http-address option overwrites the
+   * pointer without freeing it, so a preallocated default would leak. */
+  self->address = NULL;
   self->max_threads = GSTD_HTTP_DEFAULT_MAX_THREADS;
   self->server = NULL;
   self->session = NULL;
@@ -1396,6 +1398,8 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
 
   self = GSTD_HTTP (base);
   port = self->port;
+  if (NULL == self->address)
+    self->address = g_strdup (GSTD_HTTP_DEFAULT_ADDRESS);
   address = self->address;
 
   self->session = session;

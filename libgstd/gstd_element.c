@@ -527,7 +527,10 @@ gstd_element_append_object_properties (GstObject * object,
         property_name, "target", target, "pspec", properties_array[i], NULL);
 
     g_free (property_name);
-    gstd_list_append_child (properties, element_property);
+    if (!gstd_list_append_child (properties, element_property)) {
+      /* Duplicate name: the list did not take the child */
+      g_object_unref (element_property);
+    }
   }
 
   g_free (properties_array);
@@ -619,11 +622,17 @@ gstd_element_fill_signals_and_actions (GstdElement * self)
       if (query.signal_flags & G_SIGNAL_ACTION) {
         gstd_object = g_object_new (GSTD_TYPE_ACTION, "name",
             query.signal_name, "target", self->element, NULL);
-        gstd_list_append_child (self->element_actions, gstd_object);
+        if (!gstd_list_append_child (self->element_actions, gstd_object)) {
+          /* Duplicate name: the list did not take the child */
+          g_object_unref (gstd_object);
+        }
       } else {
         gstd_object = g_object_new (GSTD_TYPE_SIGNAL, "name",
             query.signal_name, "target", self->element, NULL);
-        gstd_list_append_child (self->element_signals, gstd_object);
+        if (!gstd_list_append_child (self->element_signals, gstd_object)) {
+          /* Duplicate name: the list did not take the child */
+          g_object_unref (gstd_object);
+        }
       }
     }
     g_free (signals);

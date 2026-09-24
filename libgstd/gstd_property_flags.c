@@ -76,8 +76,14 @@ gstd_property_flags_update (GstdObject * object, const gchar * svalue)
 
   g_return_val_if_fail (self->type != G_TYPE_NONE, GSTD_MISSING_INITIALIZATION);
 
-  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
-      GSTD_OBJECT_NAME (prop));
+  if (prop->pspec) {
+    pspec = prop->pspec;
+  } else {
+    pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (prop->target),
+        GSTD_OBJECT_NAME (prop));
+  }
+
+  g_return_val_if_fail (pspec, GSTD_MISSING_INITIALIZATION);
 
   g_value_init (&value, pspec->value_type);
 

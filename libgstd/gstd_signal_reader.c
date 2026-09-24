@@ -41,6 +41,9 @@ void gstd_signal_marshal (GClosure * closure, GValue * return_value,
     guint n_param_values, const GValue * param_values,
     gpointer invocation_hint, gpointer marshar_data);
 
+static void gstd_signal_reader_closure_finalized (gpointer data,
+    GClosure * closure);
+
 static void gstd_signal_reader_dispose (GObject * object);
 
 typedef struct _GstdSignalReaderClass GstdSignalReaderClass;
@@ -109,6 +112,13 @@ gstd_signal_reader_dispose (GObject * object)
 {
   GstdSignalReader *self = GSTD_SIGNAL_READER (object);
 
+  /* The signal closure holds a reference on this reader that is only
+   * released once the closure is finalized, which cannot happen while
+   * an invocation is in flight, so no marshal can race this teardown. */
+  g_mutex_lock (&self->signal_lock);
+  g_clear_object (&self->callback);
+  g_mutex_unlock (&self->signal_lock);
+
   g_mutex_clear (&self->signal_lock);
   g_cond_clear (&self->signal_call);
 
@@ -171,8 +181,12 @@ gstd_signal_reader_read_signal (GstdIReader * iface,
   /* get signal owner */
   g_object_get (object, "target", &target, NULL);
 
-  /* connect to signal */
-  closure = g_closure_new_simple (sizeof (GClosure), self);
+  /* Connect to the signal. The closure keeps the reader alive until it
+   * is finalized, which waits for any in-flight invocation: a marshal
+   * that outlives the wait below must not race our dispose. */
+  closure = g_closure_new_simple (sizeof (GClosure), g_object_ref (self));
+  g_closure_add_finalize_notifier (closure, self,
+      gstd_signal_reader_closure_finalized);
   g_closure_set_marshal (closure, gstd_signal_marshal);
   handler_id =
       g_signal_connect_closure (target, GSTD_OBJECT_NAME (object), closure,
@@ -200,8 +214,13 @@ gstd_signal_reader_read_signal (GstdIReader * iface,
   self->callback = NULL;
 
 out:
-  g_object_unref (target);
   g_signal_handler_disconnect (target, handler_id);
+  g_object_unref (target);
+  /* If the signal fired after the wait timed out, the marshal left a
+   * callback nobody will collect; release it here. A marshal that
+   * already passed the disconnect may still store one more, which the
+   * next connect or dispose releases. */
+  g_clear_object (&self->callback);
   g_mutex_unlock (&self->signal_lock);
 
   return ret;
@@ -213,14 +232,27 @@ gstd_signal_marshal (GClosure * closure, GValue * return_value,
     gpointer marshar_data)
 {
   GstdSignalReader *self = GSTD_SIGNAL_READER (closure->data);
+  GstdCallback *callback;
 
-  self->callback =
+  callback =
       gstd_callback_new (GSTD_OBJECT_NAME (self->target), return_value,
       n_param_values, param_values);
+
   g_mutex_lock (&self->signal_lock);
+  /* A callback may be stranded here if a previous wait timed out
+   * before its signal fired; release it instead of leaking it. */
+  if (self->callback)
+    g_object_unref (self->callback);
+  self->callback = callback;
   self->waiting_signal = FALSE;
   g_cond_signal (&self->signal_call);
   g_mutex_unlock (&self->signal_lock);
+}
+
+static void
+gstd_signal_reader_closure_finalized (gpointer data, GClosure * closure)
+{
+  g_object_unref (data);
 }
 
 GstdReturnCode

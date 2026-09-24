@@ -469,7 +469,8 @@ gstd_pipeline_set_property (GObject * object,
       if (self->state) {
         g_object_unref (self->state);
       }
-      self->state = g_value_get_object (value);
+      /* dispose unrefs self->state, so take a ref rather than borrow */
+      self->state = g_value_dup_object (value);
       break;
 
 #if GST_VERSION_MINOR >= 10
