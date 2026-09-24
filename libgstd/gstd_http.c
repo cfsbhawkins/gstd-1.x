@@ -166,8 +166,8 @@ gstd_http_class_init (GstdHttpClass * klass)
 
   properties[PROP_API_TOKEN] =
       g_param_spec_string ("api-token", "API token",
-      "Bearer token required on every request except /health "
-      "(NULL disables authentication)",
+      "Bearer token required on every request except GET/HEAD /health "
+      "(NULL disables authentication; an empty string is rejected)",
       NULL, G_PARAM_READWRITE);
 
   properties[PROP_CORS_ORIGIN] =
@@ -202,6 +202,13 @@ gstd_http_init (GstdHttp * self)
 
 }
 
+/* NULL disables authentication; any other value must be a usable token */
+static gboolean
+api_token_is_valid (const gchar * token)
+{
+  return token == NULL || token[0] != '\0';
+}
+
 static void
 gstd_http_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec)
@@ -220,6 +227,14 @@ gstd_http_set_property (GObject * object, guint property_id,
       self->max_threads = g_value_get_int (value);
       break;
     case PROP_API_TOKEN:
+      /* NULL is the only way to disable authentication: an empty token
+       * would read as "configured" while matching an empty credential,
+       * so refuse it and keep the current value */
+      if (!api_token_is_valid (g_value_get_string (value))) {
+        g_warning ("gstd: rejecting an empty HTTP API token; set NULL to "
+            "disable authentication");
+        break;
+      }
       /* Swapped under the lock: soup threads read it per request */
       g_mutex_lock (&self->mutex);
       g_free (self->api_token);
@@ -425,9 +440,13 @@ request_authorized (GstdHttp * self, SoupMsg * msg)
   token = g_strdup (self->api_token);
   g_mutex_unlock (&self->mutex);
 
-  if (!token || token[0] == '\0') {
-    g_free (token);
+  /* NULL is the only disabled state. An empty token is refused at
+   * configuration time; should one ever get here, fail closed. */
+  if (!token) {
     return TRUE;
+  }
+  if (token[0] == '\0') {
+    goto out;
   }
 #if SOUP_CHECK_VERSION(3,0,0)
   request_headers = soup_server_message_get_request_headers (msg);
@@ -1918,6 +1937,18 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (NULL == self->cors_origin) {
     self->cors_origin = g_strdup (g_getenv ("GSTD_HTTP_CORS_ORIGIN"));
   }
+  /* The command line writes the field directly, bypassing the property
+   * check, and the environment is only read here: validate both. An
+   * explicitly empty token must not start a server that looks
+   * authenticated but is not. */
+  if (!api_token_is_valid (self->api_token)) {
+    g_mutex_unlock (&self->mutex);
+    GST_ERROR_OBJECT (self, "Refusing to start with an empty API token");
+    g_printerr ("gstd: The HTTP API token (--http-api-token or "
+        "GSTD_HTTP_API_TOKEN) is set but empty; set a token, or unset it "
+        "to run without authentication\n");
+    return GSTD_BAD_VALUE;
+  }
   if (self->api_token) {
     GST_INFO_OBJECT (self, "HTTP API token authentication enabled");
   }
@@ -2007,8 +2038,8 @@ gstd_http_init_get_option_group (GstdIpc * base, GOptionGroup ** group)
     {"http-api-token", 0, 0, G_OPTION_ARG_STRING, &self->api_token,
           "Require this bearer token on every request except /health. "
           "Prefer the GSTD_HTTP_API_TOKEN environment variable: command "
-          "line arguments are visible to other local processes "
-          "(default: authentication disabled)",
+          "line arguments are visible to other local processes. An empty "
+          "value is rejected (default: authentication disabled)",
         "token"}
     ,
     {"http-cors-origin", 0, 0, G_OPTION_ARG_STRING, &self->cors_origin,

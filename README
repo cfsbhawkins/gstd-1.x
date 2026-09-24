@@ -34,7 +34,8 @@ opt-in hardening on top of that:
   `GSTD_HTTP_API_TOKEN` environment variable (preferred, since command
   lines are visible to other local processes). When set, every HTTP
   request except `GET`/`HEAD /health` must carry an
-  `Authorization: Bearer <token>` header.
+  `Authorization: Bearer <token>` header. An explicitly empty token is
+  a startup error rather than a silent "no authentication".
 - **CORS disabled by default** — the server no longer sends
   `Access-Control-Allow-Origin: *`, so web pages in a local browser
   cannot read API responses cross-origin. To allow a trusted web UI,

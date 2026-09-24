@@ -1020,6 +1020,134 @@ GST_START_TEST (test_http_health_method_matrix)
 }
 GST_END_TEST;
 
+/* Feed @argv through the HTTP option group, as the daemon does */
+static void
+parse_http_options (gint argc, gchar ** argv)
+{
+  GOptionContext *context;
+  GOptionGroup *group = NULL;
+  GError *error = NULL;
+  gboolean parsed;
+
+  gstd_ipc_get_option_group (GSTD_IPC (test_http), &group);
+  fail_if (NULL == group);
+
+  context = g_option_context_new (NULL);
+  g_option_context_add_group (context, group);
+  parsed = g_option_context_parse (context, &argc, &argv, &error);
+  fail_if (!parsed, "Option parsing failed: %s",
+      error ? error->message : "unknown");
+  g_option_context_free (context);
+}
+
+/*
+ * Test: an explicitly empty token in the environment is refused at
+ * startup instead of silently disabling authentication
+ */
+GST_START_TEST (test_http_empty_token_env_rejected)
+{
+  GstdReturnCode ret;
+
+  g_setenv ("GSTD_HTTP_API_TOKEN", "", TRUE);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  g_unsetenv ("GSTD_HTTP_API_TOKEN");
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an empty GSTD_HTTP_API_TOKEN");
+}
+GST_END_TEST;
+
+/*
+ * Test: --http-api-token= (empty) is refused at startup
+ */
+GST_START_TEST (test_http_empty_token_cli_rejected)
+{
+  GstdReturnCode ret;
+  gchar *argv[] = { (gchar *) "gstd", (gchar *) "--http-api-token=", NULL };
+
+  parse_http_options (2, argv);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an empty --http-api-token");
+}
+GST_END_TEST;
+
+/*
+ * Test: a non-empty token from the command line still enables auth
+ */
+GST_START_TEST (test_http_token_cli_accepted)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+  gchar *argv[] = { (gchar *) "gstd",
+    (gchar *) "--http-api-token=cli-token", NULL
+  };
+
+  parse_http_options (2, argv);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 401, "Expected 401, got %u", status_code);
+  g_free (response);
+
+  response = http_request ("GET", "/pipelines",
+      "Authorization: Bearer cli-token", &status_code, NULL);
+  fail_if (status_code != 200, "Expected 200, got %u", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: the api-token property refuses an empty string and keeps its
+ * current value, so a rotation to "" cannot disable authentication
+ */
+GST_START_TEST (test_http_empty_token_property_rejected)
+{
+  GstdReturnCode ret;
+  gchar *token = NULL;
+  gchar *response;
+  guint status_code;
+
+  /* From the default (disabled) state */
+  ASSERT_WARNING (g_object_set (test_http, "api-token", "", NULL));
+  g_object_get (test_http, "api-token", &token, NULL);
+  fail_if (token != NULL, "Empty token was stored: \"%s\"", token);
+
+  /* From a configured token: the rotation to "" is refused */
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+  ASSERT_WARNING (g_object_set (test_http, "api-token", "", NULL));
+  g_object_get (test_http, "api-token", &token, NULL);
+  fail_if (g_strcmp0 (token, "test-secret-token") != 0,
+      "Token changed to \"%s\" after an empty assignment", token);
+  g_free (token);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  /* Still enforced; an empty bearer credential does not match */
+  response = http_request ("GET", "/pipelines", "Authorization: Bearer ",
+      &status_code, NULL);
+  fail_if (status_code != 401, "Empty bearer returned %u, expected 401",
+      status_code);
+  g_free (response);
+
+  /* NULL remains the explicit way to disable authentication */
+  g_object_set (test_http, "api-token", NULL, NULL);
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 200, "Expected 200 once disabled, got %u",
+      status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -1051,6 +1179,10 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_declared_length_too_large);
   tcase_add_test (tc, test_http_body_within_limit);
   tcase_add_test (tc, test_http_health_method_matrix);
+  tcase_add_test (tc, test_http_empty_token_env_rejected);
+  tcase_add_test (tc, test_http_empty_token_cli_rejected);
+  tcase_add_test (tc, test_http_token_cli_accepted);
+  tcase_add_test (tc, test_http_empty_token_property_rejected);
 
   return suite;
 }

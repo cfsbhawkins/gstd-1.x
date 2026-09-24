@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unauthenticated `200`. Only `GET` and `HEAD` are exempt now. Every
   other method gets `405` with `Allow: GET, HEAD`, whether or not it
   carries a token, and `OPTIONS` goes to the shared empty preflight.
+- **An empty API token no longer disables authentication while
+  reporting it enabled** (`gstd_http.c`). `NULL` and `""` both skipped
+  auth, but startup logged it as enabled for any non-`NULL` value, so
+  `GSTD_HTTP_API_TOKEN=""` or `--http-api-token=` failed open. `NULL` is
+  now the only disabled state. An empty token from the environment or
+  the command line makes the HTTP server refuse to start. The
+  `api-token` property rejects `""` with a warning and keeps its
+  current value, and the request check fails closed if an empty token
+  ever reaches it.
 
 ### Fixed
 - **CI breakage** across the workflow matrix:

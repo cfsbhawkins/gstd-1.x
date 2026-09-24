@@ -27,7 +27,9 @@ info:
     `WWW-Authenticate: Bearer` header. `OPTIONS` preflights are answered
     with an empty `200` and are never dispatched to any endpoint.
     By default (no token configured) the API is unauthenticated,
-    matching upstream gstd.
+    matching upstream gstd. A token that is set but empty
+    (`GSTD_HTTP_API_TOKEN=` or `--http-api-token=`) is rejected at startup,
+    so authentication can only be disabled by leaving it unset.
 
     ## CORS (fork-specific, opt-in)
 
