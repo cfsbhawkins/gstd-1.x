@@ -22,6 +22,11 @@
 #include "config.h"
 #endif
 
+#include <stdlib.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #include "gstd_event_handler.h"
 #include "gstd_pipeline.h"
 #include "gstd_session.h"
@@ -46,6 +51,8 @@ static GstdReturnCode gstd_parser_read (GstdSession * session,
     GstdObject * obj, gchar * args, gchar ** reponse);
 static GstdReturnCode gstd_parser_update (GstdSession * session,
     GstdObject * obj, gchar * args, gchar ** response);
+static gboolean gstd_parser_is_delete_cmd (const gchar * action);
+static void gstd_parser_trim_freed_memory (GstdSession * session);
 static GstdReturnCode gstd_parser_delete (GstdSession * session,
     GstdObject * obj, gchar * args, gchar ** response);
 static GstdReturnCode gstd_parser_parse_raw_cmd (GstdSession * session,
@@ -250,6 +257,10 @@ gstd_parser_parse_cmd (GstdSession * session, const gchar * cmd,
 
   if (ret == GSTD_BAD_COMMAND)
     GST_ERROR_OBJECT (session, "Unknown command \"%s\"", action);
+
+  if (GSTD_EOK == ret && gstd_parser_is_delete_cmd (action))
+    gstd_parser_trim_freed_memory (session);
+
   g_strfreev (tokens);
 
   return ret;
@@ -362,6 +373,30 @@ gstd_parser_delete (GstdSession * session, GstdObject * obj, gchar * args,
   return gstd_object_delete (obj, args);
 }
 
+static gboolean
+gstd_parser_is_delete_cmd (const gchar * action)
+{
+  return !g_ascii_strcasecmp ("delete", action)
+      || !g_ascii_strcasecmp ("pipeline_delete", action);
+}
+
+static void
+gstd_parser_trim_freed_memory (GstdSession * session)
+{
+#ifdef __GLIBC__
+  /* Best-effort: returns whole free pages parked in glibc's malloc
+   * arena bins to the kernel; per-thread tcaches and non-main arena
+   * tops are left in place. Must run only after a delete that actually
+   * destroyed a pipeline has dropped every gstd lock, since it takes
+   * each arena mutex in turn. */
+  gint released = malloc_trim (0);
+
+  GST_DEBUG_OBJECT (session, "malloc_trim after delete: %s",
+      released ? "returned memory to the kernel" : "nothing to return");
+#else
+  (void) session;
+#endif
+}
 
 static GstdReturnCode
 gstd_parser_pipeline_create (GstdSession * session, gchar * action,
@@ -1064,6 +1099,7 @@ gstd_parser_pipeline_delete_ref (GstdSession * session, gchar * action,
   GstdObject *pipeline_node = NULL;
   GstdReturnCode ret = GSTD_EOK;
   guint refcount = 0;
+  gboolean deleted = FALSE;
 
   g_return_val_if_fail (GSTD_IS_SESSION (session), GSTD_NULL_ARGUMENT);
   g_return_val_if_fail (action, GSTD_NULL_ARGUMENT);
@@ -1088,6 +1124,7 @@ gstd_parser_pipeline_delete_ref (GstdSession * session, gchar * action,
   g_object_get (pipeline_node, "refcount", &refcount, NULL);
   if (1 == refcount) {
     ret = gstd_parser_pipeline_delete (session, action, args, response);
+    deleted = (GSTD_EOK == ret);
   } else {
     ret = gstd_pipeline_decrement_refcount (GSTD_PIPELINE (pipeline_node));
   }
@@ -1099,6 +1136,12 @@ pipeline_node_error:
   }
   GST_OBJECT_UNLOCK (session);
   gst_object_unref (pipeline_list_node);
+
+  /* A refcount-only decrement destroys nothing, so only trim when the
+   * pipeline actually went away, now that the session lock is dropped */
+  if (deleted)
+    gstd_parser_trim_freed_memory (session);
+
 pipeline_list_node_error:
   return ret;
 }
