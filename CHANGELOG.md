@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api-token` property rejects `""` with a warning and keeps its
   current value, and the request check fails closed if an empty token
   ever reaches it.
+- **Wildcard and malformed CORS origins rejected** (`gstd_http.c`). The
+  configured origin was echoed verbatim, `*` was explicitly supported,
+  and the command line, environment, and property accepted any string.
+  The origin must now be exactly one serialized origin,
+  `http(s)://host[:port]` (lowercase, no default port). `*`, `null`,
+  paths, trailing slashes, queries, fragments, credentials, and lists
+  make the HTTP server refuse to start. The `cors-origin` property
+  rejects them with a warning and keeps its current value. `Vary: Origin`
+  is now always sent with the origin.
 
 ### Fixed
 - **CI breakage** across the workflow matrix:

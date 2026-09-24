@@ -39,7 +39,10 @@ opt-in hardening on top of that:
 - **CORS disabled by default** — the server no longer sends
   `Access-Control-Allow-Origin: *`, so web pages in a local browser
   cannot read API responses cross-origin. To allow a trusted web UI,
-  set `--http-cors-origin <origin>` or `GSTD_HTTP_CORS_ORIGIN`.
+  set `--http-cors-origin <origin>` or `GSTD_HTTP_CORS_ORIGIN` to exactly
+  one origin such as `https://ui.example.com` or `http://127.0.0.1:8080`.
+  A wildcard (`*`), a path or trailing slash, a query, credentials, or a
+  list is a startup error.
 - **Pipeline cap** — `--max-pipelines <count>` or `GSTD_MAX_PIPELINES`
   limits how many pipelines may exist at once (default: unlimited),
   bounding memory/FD exhaustion from runaway clients.

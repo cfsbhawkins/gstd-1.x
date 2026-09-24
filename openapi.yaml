@@ -35,8 +35,13 @@ info:
 
     No CORS headers are emitted unless the daemon is started with
     `--http-cors-origin <origin>` or `GSTD_HTTP_CORS_ORIGIN`, so browser
-    pages cannot read API responses cross-origin by default. A configured
-    non-wildcard origin is echoed with `Vary: Origin`.
+    pages cannot read API responses cross-origin by default. The value
+    must be exactly one serialized origin, `http(s)://host[:port]` in
+    lowercase with no default port (for example `https://ui.example.com`
+    or `http://127.0.0.1:8080`). A wildcard (`*`), `null`, a path or
+    trailing slash, a query, a fragment, credentials, or a list is rejected
+    when the daemon starts. The configured origin is echoed with
+    `Vary: Origin`.
 
     ## Input validation (fork-specific)
 

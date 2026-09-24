@@ -172,8 +172,8 @@ gstd_http_class_init (GstdHttpClass * klass)
 
   properties[PROP_CORS_ORIGIN] =
       g_param_spec_string ("cors-origin", "CORS origin",
-      "Origin allowed in CORS response headers "
-      "(NULL emits no CORS headers)",
+      "Origin allowed in CORS response headers: one http(s)://host[:port] "
+      "origin, never \"*\" (NULL emits no CORS headers)",
       NULL, G_PARAM_READWRITE);
 
   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
@@ -209,6 +209,104 @@ api_token_is_valid (const gchar * token)
   return token == NULL || token[0] != '\0';
 }
 
+/*
+ * A CORS origin must be exactly one concrete serialized origin, as a
+ * browser sends it in the Origin header and compares it byte for byte
+ * against Access-Control-Allow-Origin: http or https, a lowercase host
+ * (DNS name, IPv4, or bracketed IPv6) and an optional non-default port,
+ * nothing else. That rules out "*", "null", paths (including a trailing
+ * slash), queries, fragments, credentials, and lists. NULL disables CORS.
+ */
+static gboolean
+cors_origin_is_valid (const gchar * origin)
+{
+  const gchar *host = NULL;
+  const gchar *host_end = NULL;
+  const gchar *port = NULL;
+  const gchar *c = NULL;
+  gchar *literal = NULL;
+  gboolean https = FALSE;
+  gboolean valid = FALSE;
+  guint64 port_value = 0;
+
+  if (!origin) {
+    return TRUE;
+  }
+
+  if (g_str_has_prefix (origin, "http://")) {
+    host = origin + strlen ("http://");
+  } else if (g_str_has_prefix (origin, "https://")) {
+    host = origin + strlen ("https://");
+    https = TRUE;
+  } else {
+    return FALSE;
+  }
+
+  if (host[0] == '[') {
+    /* IPv6 literal */
+    host_end = strchr (host, ']');
+    if (!host_end) {
+      return FALSE;
+    }
+    literal = g_strndup (host + 1, host_end - host - 1);
+    valid = strchr (literal, ':') != NULL;
+    for (c = literal; valid && *c; c++) {
+      valid = g_ascii_isdigit (*c) || (*c >= 'a' && *c <= 'f')
+          || *c == ':' || *c == '.';
+    }
+    valid = valid && g_hostname_is_ip_address (literal);
+    g_free (literal);
+    if (!valid) {
+      return FALSE;
+    }
+    port = host_end + 1;
+  } else {
+    for (c = host; *c && *c != ':'; c++) {
+      if (!g_ascii_islower (*c) && !g_ascii_isdigit (*c) && *c != '-'
+          && *c != '.') {
+        return FALSE;
+      }
+    }
+    host_end = c;
+    if (host_end == host || host[0] == '.' || host[0] == '-'
+        || host_end[-1] == '.' || host_end[-1] == '-'
+        || g_strstr_len (host, host_end - host, "..")) {
+      return FALSE;
+    }
+    port = host_end;
+  }
+
+  if (port[0] == '\0') {
+    return TRUE;
+  }
+  if (port[0] != ':') {
+    return FALSE;
+  }
+  port++;
+
+  /* Serialized ports have no leading zero and omit the scheme default */
+  if (port[0] == '\0' || port[0] == '0' || strlen (port) > 5) {
+    return FALSE;
+  }
+  for (c = port; *c; c++) {
+    if (!g_ascii_isdigit (*c)) {
+      return FALSE;
+    }
+  }
+  port_value = g_ascii_strtoull (port, NULL, 10);
+  if (port_value > G_MAXUINT16 || (https && port_value == 443)
+      || (!https && port_value == 80)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+#define GSTD_HTTP_CORS_ORIGIN_HINT \
+  "a single origin such as https://ui.example.com or " \
+  "http://127.0.0.1:8080 (lowercase, no default port, no \"*\", path, " \
+  "trailing slash, query, fragment, credentials, or list)"
+
 static void
 gstd_http_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec)
@@ -242,6 +340,12 @@ gstd_http_set_property (GObject * object, guint property_id,
       g_mutex_unlock (&self->mutex);
       break;
     case PROP_CORS_ORIGIN:
+      /* Refuse a wildcard or malformed origin and keep the current one */
+      if (!cors_origin_is_valid (g_value_get_string (value))) {
+        g_warning ("gstd: rejecting CORS origin \"%s\"; expected "
+            GSTD_HTTP_CORS_ORIGIN_HINT, g_value_get_string (value));
+        break;
+      }
       g_mutex_lock (&self->mutex);
       g_free (self->cors_origin);
       self->cors_origin = g_value_dup_string (value);
@@ -380,9 +484,9 @@ add_cors_headers (GstdHttp * self, SoupMessageHeaders * response_headers,
       "origin,range,content-type,authorization");
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Methods", methods);
-  if (g_strcmp0 (origin, "*") != 0) {
-    soup_message_headers_append (response_headers, "Vary", "Origin");
-  }
+  /* The origin is always one concrete origin (a wildcard is refused at
+   * configuration time), so caches must key on the request's Origin */
+  soup_message_headers_append (response_headers, "Vary", "Origin");
 
   g_free (origin);
 }
@@ -1949,6 +2053,13 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
         "to run without authentication\n");
     return GSTD_BAD_VALUE;
   }
+  if (!cors_origin_is_valid (self->cors_origin)) {
+    g_mutex_unlock (&self->mutex);
+    GST_ERROR_OBJECT (self, "Refusing to start with an invalid CORS origin");
+    g_printerr ("gstd: Invalid HTTP CORS origin (--http-cors-origin or "
+        "GSTD_HTTP_CORS_ORIGIN); expected " GSTD_HTTP_CORS_ORIGIN_HINT "\n");
+    return GSTD_BAD_VALUE;
+  }
   if (self->api_token) {
     GST_INFO_OBJECT (self, "HTTP API token authentication enabled");
   }
@@ -2044,8 +2155,9 @@ gstd_http_init_get_option_group (GstdIpc * base, GOptionGroup ** group)
     ,
     {"http-cors-origin", 0, 0, G_OPTION_ARG_STRING, &self->cors_origin,
           "Origin allowed in CORS response headers, or GSTD_HTTP_CORS_ORIGIN "
-          "env var (default: no CORS headers, cross-origin browser access "
-          "disabled)",
+          "env var. Exactly one http(s)://host[:port] origin; \"*\", paths, "
+          "and lists are rejected (default: no CORS headers, cross-origin "
+          "browser access disabled)",
         "origin"}
     ,
     {NULL}

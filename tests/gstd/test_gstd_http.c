@@ -1148,6 +1148,141 @@ GST_START_TEST (test_http_empty_token_property_rejected)
 }
 GST_END_TEST;
 
+/* Origins that are not exactly one concrete serialized http(s) origin */
+static const gchar *invalid_cors_origins[] = {
+  "*",
+  "",
+  "null",
+  "example.com",
+  "ftp://example.com",
+  "http://",
+  "http://example.com/",
+  "http://example.com/app",
+  "http://example.com?x=1",
+  "http://example.com#top",
+  "http://user@example.com",
+  "http://user:pass@example.com",
+  "http://a.example.com,http://b.example.com",
+  "http://a.example.com http://b.example.com",
+  "http://example.com\r\nX-Injected: 1",
+  "HTTP://example.com",
+  "http://Example.com",
+  "http://*.example.com",
+  "http://example..com",
+  "http://.example.com",
+  "http://example.com.",
+  "http://example.com:",
+  "http://example.com:0",
+  "http://example.com:080",
+  "http://example.com:65536",
+  "http://example.com:8080x",
+  "http://example.com:80",
+  "https://example.com:443",
+  "http://[::1",
+  "http://[zz::1]",
+  "http://[127.0.0.1]",
+  "http://[::1]x",
+  NULL
+};
+
+/*
+ * Test: the cors-origin property refuses wildcard and malformed origins
+ * and keeps its current value; concrete origins are accepted
+ */
+GST_START_TEST (test_http_cors_origin_property_validation)
+{
+  static const gchar *valid[] = {
+    "http://example.com",
+    "https://ui.example.com:8443",
+    "http://127.0.0.1:3000",
+    "http://[::1]:8080",
+    "http://localhost",
+    "https://example.com:80",
+    NULL
+  };
+  gchar *origin = NULL;
+  guint i;
+
+  for (i = 0; invalid_cors_origins[i]; i++) {
+    ASSERT_WARNING (g_object_set (test_http, "cors-origin",
+            invalid_cors_origins[i], NULL));
+    g_object_get (test_http, "cors-origin", &origin, NULL);
+    fail_if (origin != NULL, "Invalid origin \"%s\" was stored",
+        invalid_cors_origins[i]);
+  }
+
+  for (i = 0; valid[i]; i++) {
+    g_object_set (test_http, "cors-origin", valid[i], NULL);
+    g_object_get (test_http, "cors-origin", &origin, NULL);
+    fail_if (g_strcmp0 (origin, valid[i]) != 0,
+        "Valid origin \"%s\" was not stored", valid[i]);
+    g_free (origin);
+  }
+
+  /* A rejected assignment keeps the configured origin */
+  g_object_set (test_http, "cors-origin", "http://example.com", NULL);
+  ASSERT_WARNING (g_object_set (test_http, "cors-origin", "*", NULL));
+  g_object_get (test_http, "cors-origin", &origin, NULL);
+  fail_if (g_strcmp0 (origin, "http://example.com") != 0,
+      "Origin changed to \"%s\" after a rejected assignment", origin);
+  g_free (origin);
+
+  /* NULL still disables CORS */
+  g_object_set (test_http, "cors-origin", NULL, NULL);
+  g_object_get (test_http, "cors-origin", &origin, NULL);
+  fail_if (origin != NULL);
+}
+GST_END_TEST;
+
+/*
+ * Test: a wildcard or malformed GSTD_HTTP_CORS_ORIGIN is refused at startup
+ */
+GST_START_TEST (test_http_cors_origin_env_rejected)
+{
+  GstdReturnCode ret;
+  guint i;
+
+  for (i = 0; invalid_cors_origins[i]; i++) {
+    g_setenv ("GSTD_HTTP_CORS_ORIGIN", invalid_cors_origins[i], TRUE);
+
+    ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+    fail_if (ret == GSTD_EOK,
+        "HTTP server started with GSTD_HTTP_CORS_ORIGIN=\"%s\"",
+        invalid_cors_origins[i]);
+
+    /* The env value is only a fallback for an unset origin: clear it so
+     * the next iteration reads the environment again */
+    g_object_set (test_http, "cors-origin", NULL, NULL);
+  }
+  g_unsetenv ("GSTD_HTTP_CORS_ORIGIN");
+}
+GST_END_TEST;
+
+/*
+ * Test: --http-cors-origin=* and a path-bearing origin are refused at
+ * startup
+ */
+GST_START_TEST (test_http_cors_origin_cli_rejected)
+{
+  GstdReturnCode ret;
+  gchar *wildcard[] = { (gchar *) "gstd", (gchar *) "--http-cors-origin=*",
+    NULL
+  };
+  gchar *with_path[] = { (gchar *) "gstd",
+    (gchar *) "--http-cors-origin=http://example.com/app", NULL
+  };
+
+  parse_http_options (2, wildcard);
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK, "HTTP server started with --http-cors-origin=*");
+
+  parse_http_options (2, with_path);
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an origin carrying a path");
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -1183,6 +1318,9 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_empty_token_cli_rejected);
   tcase_add_test (tc, test_http_token_cli_accepted);
   tcase_add_test (tc, test_http_empty_token_property_rejected);
+  tcase_add_test (tc, test_http_cors_origin_property_validation);
+  tcase_add_test (tc, test_http_cors_origin_env_rejected);
+  tcase_add_test (tc, test_http_cors_origin_cli_rejected);
 
   return suite;
 }
