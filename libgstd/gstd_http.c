@@ -40,9 +40,11 @@ GST_DEBUG_CATEGORY_STATIC (gstd_http_debug);
 
 #define GSTD_DEBUG_DEFAULT_LEVEL GST_LEVEL_INFO
 
-/* Upper bound on the request body we are willing to parse. Pipeline
+/* Upper bound on the request body we are willing to buffer. Pipeline
  * descriptions and property values are small, so a generous cap is safe for
- * every client while bounding the work done on a hostile oversized request. */
+ * every client while bounding the memory a hostile request can pin. It is
+ * enforced while the body is received (see request_started_cb), before any
+ * handler runs. */
 #define GSTD_HTTP_MAX_BODY_SIZE (8 * 1024 * 1024)
 
 #if SOUP_CHECK_VERSION(3,0,0)
@@ -780,7 +782,20 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   request_headers = msg->request_headers;
 #endif
 
-  if (!request_body) {
+  if (!request_body || request_body->length == 0) {
+    return;
+  }
+
+  /* Only JSON bodies carry parameters; never copy anything else */
+  content_type = soup_message_headers_get_content_type (request_headers, NULL);
+  if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
+    return;
+  }
+
+  /* The limit is enforced while the body is received, so an oversized
+   * request never reaches a handler; this guards the flatten below in
+   * case that invariant is ever broken. */
+  if (request_body->length > GSTD_HTTP_MAX_BODY_SIZE) {
     return;
   }
 
@@ -808,18 +823,6 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     return;
   }
 #endif
-
-  content_type = soup_message_headers_get_content_type (request_headers, NULL);
-
-  if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
-    goto out;
-  }
-
-  /* Bound the work on an oversized body (defends chunked requests with no
-   * Content-Length, which the early check in server_callback cannot catch). */
-  if (body_length > GSTD_HTTP_MAX_BODY_SIZE) {
-    goto out;
-  }
 
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
@@ -1679,34 +1682,9 @@ server_callback (SoupServer * server, SoupMessage * msg,
     return;
   }
 
-  /* Reject oversized request bodies up front (DoS guard). Pipeline
-   * descriptions and property values are small, so the cap never affects a
-   * legitimate client. */
-  {
-    SoupMessageHeaders *req_headers = NULL;
-    static const char *too_large =
-        "{ \"code\": 1, \"description\": \"Request body too large\","
-        " \"response\": null }";
-#if SOUP_CHECK_VERSION(3,0,0)
-    req_headers = soup_server_message_get_request_headers (msg);
-#else
-    req_headers = msg->request_headers;
-#endif
-    if (req_headers && soup_message_headers_get_content_length (req_headers) >
-        GSTD_HTTP_MAX_BODY_SIZE) {
-#if SOUP_CHECK_VERSION(3,0,0)
-      soup_server_message_set_response (msg, "application/json",
-          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
-      soup_server_message_set_status (msg,
-          SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE, NULL);
-#else
-      soup_message_set_response (msg, "application/json",
-          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
-      soup_message_set_status (msg, SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE);
-#endif
-      return;
-    }
-  }
+  /* Oversized bodies never get here: request_started_cb rejects them with
+   * 413 while they are received, and libsoup skips every handler for a
+   * message that already carries a status. */
 
   data_request = g_new0 (GstdHttpRequest, 1);
 
@@ -1764,6 +1742,121 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
 }
 
+/*
+ * Reject a request whose body exceeds GSTD_HTTP_MAX_BODY_SIZE. Whatever
+ * was buffered is released and the rest of the body is discarded as it
+ * arrives instead of accumulated. Setting the status here makes libsoup
+ * skip every handler, and the connection is closed after the response so
+ * leftover body bytes can never be parsed as a new request.
+ */
+static void
+reject_oversized_request (GstdHttp * self, SoupMsg * msg)
+{
+  static const char *too_large =
+      "{ \"code\": 1, \"description\": \"Request body too large\","
+      " \"response\": null }";
+  SoupMessageBody *request_body = NULL;
+  SoupMessageHeaders *response_headers = NULL;
+  guint status = 0;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_body = soup_server_message_get_request_body (msg);
+  response_headers = soup_server_message_get_response_headers (msg);
+  status = soup_server_message_get_status (msg);
+#else
+  request_body = msg->request_body;
+  response_headers = msg->response_headers;
+  status = msg->status_code;
+#endif
+
+  soup_message_body_set_accumulate (request_body, FALSE);
+  soup_message_body_truncate (request_body);
+
+  /* libsoup may already have failed the request (e.g. a bad path); keep
+   * its status, it only needed the buffering stopped */
+  if (status != 0) {
+    return;
+  }
+
+  GST_WARNING_OBJECT (self, "Rejecting request body larger than %d bytes",
+      GSTD_HTTP_MAX_BODY_SIZE);
+
+  soup_message_headers_replace (response_headers, "Connection", "close");
+  add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+  soup_server_message_set_status (msg,
+      SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+  soup_message_set_status (msg, SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE);
+#endif
+}
+
+/* A declared Content-Length over the limit is rejected before any body
+ * byte is read; with "Expect: 100-continue" libsoup then skips the body */
+static void
+request_got_headers_cb (SoupMsg * msg, gpointer data)
+{
+  SoupMessageHeaders *request_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_headers = soup_server_message_get_request_headers (msg);
+#else
+  request_headers = msg->request_headers;
+#endif
+
+  if (soup_message_headers_get_encoding (request_headers) ==
+      SOUP_ENCODING_CONTENT_LENGTH
+      && soup_message_headers_get_content_length (request_headers) >
+      GSTD_HTTP_MAX_BODY_SIZE) {
+    reject_oversized_request (GSTD_HTTP (data), msg);
+  }
+}
+
+/* Chunked (or otherwise unsized) bodies are counted as they arrive: the
+ * body accumulates, so its length is the running total */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+request_got_chunk_cb (SoupMsg * msg, GBytes * chunk, gpointer data)
+#else
+request_got_chunk_cb (SoupMsg * msg, SoupBuffer * chunk, gpointer data)
+#endif
+{
+  SoupMessageBody *request_body = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_body = soup_server_message_get_request_body (msg);
+#else
+  request_body = msg->request_body;
+#endif
+
+  if (request_body->length > GSTD_HTTP_MAX_BODY_SIZE) {
+    reject_oversized_request (GSTD_HTTP (data), msg);
+  }
+}
+
+/*
+ * Runs for every request before libsoup reads it, so the body limit is
+ * enforced for every method, content type, and endpoint (fast paths
+ * included) before any handler dispatch or body flattening.
+ */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+request_started_cb (SoupServer * server, SoupMsg * msg, gpointer data)
+#else
+request_started_cb (SoupServer * server, SoupMsg * msg,
+    SoupClientContext * client, gpointer data)
+#endif
+{
+  g_signal_connect (msg, "got-headers",
+      G_CALLBACK (request_got_headers_cb), data);
+  g_signal_connect (msg, "got-chunk", G_CALLBACK (request_got_chunk_cb), data);
+}
+
 static GstdReturnCode
 gstd_http_start (GstdIpc * base, GstdSession * session)
 {
@@ -1805,6 +1898,8 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (!self->server) {
     goto noconnection;
   }
+  g_signal_connect (self->server, "request-started",
+      G_CALLBACK (request_started_cb), self);
   self->pool =
       g_thread_pool_new (do_request, NULL, self->max_threads, FALSE, &error);
 

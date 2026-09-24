@@ -214,6 +214,131 @@ http_get (const gchar * path, guint * status_code)
   return http_request ("GET", path, NULL, status_code, NULL);
 }
 
+/* Must match GSTD_HTTP_MAX_BODY_SIZE in gstd_http.c */
+#define TEST_MAX_BODY_SIZE (8 * 1024 * 1024)
+
+typedef enum
+{
+  BODY_CHUNKED,                 /* Transfer-Encoding: chunked */
+  BODY_FIXED,                   /* Content-Length, whole body sent */
+  BODY_EXPECT_CONTINUE          /* Content-Length + Expect: 100-continue,
+                                 * no body sent unless the server asks */
+} BodyMode;
+
+/*
+ * Send @body_size bytes of filler (or @body verbatim when non-NULL) as the
+ * request body of @method @request_target, then read the response status.
+ * Returns the response body; caller frees.
+ */
+static gchar *
+http_request_with_body (const gchar * method, const gchar * request_target,
+    const gchar * content_type, BodyMode mode, const gchar * body,
+    gsize body_size, guint * status_code)
+{
+  GSocketClient *client;
+  GSocketConnection *conn;
+  GInputStream *istream;
+  GOutputStream *ostream;
+  GError *error = NULL;
+  GString *head;
+  gchar *filler;
+  gchar *response;
+  gsize sent = 0;
+  gsize piece;
+  gssize bytes_read;
+  gsize total_read = 0;
+  gboolean ok = TRUE;
+  gchar buffer[8192];
+  const gsize piece_max = 64 * 1024;
+
+  *status_code = 0;
+  if (body) {
+    body_size = strlen (body);
+  }
+
+  client = g_socket_client_new ();
+  conn = g_socket_client_connect_to_host (client,
+      TEST_HTTP_ADDRESS, TEST_HTTP_PORT, NULL, &error);
+  if (!conn) {
+    g_clear_error (&error);
+    g_object_unref (client);
+    return NULL;
+  }
+
+  ostream = g_io_stream_get_output_stream (G_IO_STREAM (conn));
+  istream = g_io_stream_get_input_stream (G_IO_STREAM (conn));
+
+  head = g_string_new (NULL);
+  g_string_append_printf (head, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n",
+      method, request_target, TEST_HTTP_ADDRESS, TEST_HTTP_PORT);
+  g_string_append_printf (head, "Content-Type: %s\r\n", content_type);
+  if (mode == BODY_CHUNKED) {
+    g_string_append (head, "Transfer-Encoding: chunked\r\n");
+  } else {
+    g_string_append_printf (head, "Content-Length: %" G_GSIZE_FORMAT "\r\n",
+        body_size);
+  }
+  if (mode == BODY_EXPECT_CONTINUE) {
+    g_string_append (head, "Expect: 100-continue\r\n");
+  }
+  g_string_append (head, "Connection: close\r\n\r\n");
+
+  ok = g_output_stream_write_all (ostream, head->str, head->len, NULL, NULL,
+      NULL);
+  g_string_free (head, TRUE);
+
+  filler = g_malloc (piece_max);
+  memset (filler, 'a', piece_max);
+
+  while (ok && mode != BODY_EXPECT_CONTINUE && sent < body_size) {
+    const gchar *data = body ? body + sent : filler;
+
+    piece = MIN (piece_max, body_size - sent);
+    if (mode == BODY_CHUNKED) {
+      gchar *size_line = g_strdup_printf ("%" G_GSIZE_MODIFIER "x\r\n", piece);
+
+      ok = g_output_stream_write_all (ostream, size_line, strlen (size_line),
+          NULL, NULL, NULL);
+      g_free (size_line);
+    }
+    ok = ok && g_output_stream_write_all (ostream, data, piece, NULL, NULL,
+        NULL);
+    if (mode == BODY_CHUNKED) {
+      ok = ok && g_output_stream_write_all (ostream, "\r\n", 2, NULL, NULL,
+          NULL);
+    }
+    sent += piece;
+  }
+  if (ok && mode == BODY_CHUNKED) {
+    g_output_stream_write_all (ostream, "0\r\n\r\n", 5, NULL, NULL, NULL);
+  }
+  g_free (filler);
+
+  /* Connection: close, so read until EOF */
+  while (total_read < sizeof (buffer) - 1) {
+    bytes_read = g_input_stream_read (istream, buffer + total_read,
+        sizeof (buffer) - 1 - total_read, NULL, NULL);
+    if (bytes_read <= 0) {
+      break;
+    }
+    total_read += bytes_read;
+  }
+  buffer[total_read] = '\0';
+
+  if (sscanf (buffer, "HTTP/1.%*d %u", status_code) != 1) {
+    *status_code = 0;
+  }
+
+  response = strstr (buffer, "\r\n\r\n");
+  response = g_strdup (response ? response + 4 : "");
+
+  g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
+  g_object_unref (conn);
+  g_object_unref (client);
+
+  return response;
+}
+
 /*
  * Test: HTTP server starts successfully
  */
@@ -685,6 +810,154 @@ GST_START_TEST (test_http_unauthorized_carries_cors)
 }
 GST_END_TEST;
 
+/*
+ * Test: a chunked body (no Content-Length) past the limit is rejected
+ * with 413 while it is received, for JSON and non-JSON alike
+ */
+GST_START_TEST (test_http_chunked_body_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized chunked JSON returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("POST",
+      "/pipelines?name=p&description=fakesrc%20!%20fakesink", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized chunked text/plain returned %u, expected 413", status_code);
+  g_free (response);
+
+  /* The rejected create must not have run */
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (status_code != 200);
+  fail_if (strstr (response, "\"count\": 0") == NULL,
+      "An oversized request must not reach the handler: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: fast-path endpoints, which answer without the thread pool, are
+ * subject to the same limit
+ */
+GST_START_TEST (test_http_fast_path_body_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST",
+      "/pipelines/clock_sync?source=a&targets=b", "application/octet-stream",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized clock_sync body returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/pipelines/status",
+      "application/json", BODY_FIXED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized /pipelines/status body returned %u, expected 413",
+      status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/health", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized /health body returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/elements/fakesrc", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized /elements body returned %u, expected 413", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: an oversized Content-Length is rejected from the headers alone,
+ * so a client using Expect: 100-continue never has to send the body
+ */
+GST_START_TEST (test_http_declared_length_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines", "text/plain",
+      BODY_EXPECT_CONTINUE, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized declared length returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/p/state",
+      "application/json", BODY_FIXED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized fixed-length body returned %u, expected 413", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: bodies within the limit still work, chunked or not
+ */
+GST_START_TEST (test_http_body_within_limit)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_CHUNKED,
+      "{\"name\": \"chunked_pipe\", \"description\": \"fakesrc ! fakesink\"}",
+      0, &status_code);
+  fail_if (status_code != 200,
+      "Chunked JSON create returned %u, expected 200", status_code);
+  g_free (response);
+
+  /* Exactly at the limit is allowed */
+  response = http_request_with_body ("GET", "/health", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE, &status_code);
+  fail_if (status_code != 200,
+      "Body at the limit returned %u, expected 200", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (strstr (response, "chunked_pipe") == NULL,
+      "Chunked JSON create did not create the pipeline: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -711,6 +984,10 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_pipeline_cap_returns_429);
   tcase_add_test (tc, test_http_rejects_path_with_whitespace);
   tcase_add_test (tc, test_http_unauthorized_carries_cors);
+  tcase_add_test (tc, test_http_chunked_body_too_large);
+  tcase_add_test (tc, test_http_fast_path_body_too_large);
+  tcase_add_test (tc, test_http_declared_length_too_large);
+  tcase_add_test (tc, test_http_body_within_limit);
 
   return suite;
 }

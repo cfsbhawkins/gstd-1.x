@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **HTTP body limit enforced while the request is received**
+  (`gstd_http.c`). The 8 MiB cap used to be a `Content-Length` check
+  that ran after the fast paths, plus a length check after
+  `soup_message_body_flatten()`. A chunked body was therefore buffered and
+  flattened in full before it was checked, and fast-path or non-JSON
+  requests were never checked. The server now hooks every request on
+  `request-started`. A declared `Content-Length` over the cap is rejected
+  from the headers, so an `Expect: 100-continue` client never sends the
+  body. Chunked bodies are counted as they arrive and rejected once the
+  total passes the cap. Either way the request gets `413` for every
+  method, content type, and endpoint before any handler runs. Buffered
+  bytes are released, the remainder is discarded without buffering, and
+  the connection closes after the response. `parse_json_body` now checks
+  the content type and size before it flattens anything.
+
 ### Fixed
 - **CI breakage** across the workflow matrix:
   - `gstd_action.c` / `gstd_http.c` mixed declarations failed

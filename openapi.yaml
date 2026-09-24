@@ -8,8 +8,14 @@ info:
     properties over HTTP. All responses follow a consistent JSON envelope format.
 
     Request bodies larger than 8 MiB are rejected with `413 Request Entity Too
-    Large`; pipeline descriptions and property values are well within this
-    bound, so normal clients are unaffected.
+    Large` on every endpoint, for every method and content type, whether
+    the size is declared with `Content-Length` or the body is sent chunked.
+    The limit is enforced while the body is received, before the request
+    is dispatched. An oversized declared length is rejected from the
+    headers alone (a client sending `Expect: 100-continue` never has to
+    send the body), and the connection is closed after the `413`.
+    Pipeline descriptions and property values are well within this bound,
+    so normal clients are unaffected.
 
     ## Authentication (fork-specific, opt-in)
 
