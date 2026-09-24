@@ -22,7 +22,7 @@ info:
     When the daemon is started with `--http-api-token <token>` or the
     `GSTD_HTTP_API_TOKEN` environment variable (preferred, since command
     lines are visible to other local processes), every request except
-    `GET /health` must carry an `Authorization: Bearer <token>` header.
+    `GET`/`HEAD /health` must carry an `Authorization: Bearer <token>` header.
     Requests without a valid token receive `401` with a
     `WWW-Authenticate: Bearer` header. `OPTIONS` preflights are answered
     with an empty `200` and are never dispatched to any endpoint.
@@ -97,8 +97,11 @@ paths:
         stuck pipeline; it answers on a fast path that bypasses the request
         thread pool.
 
-        Suitable for Docker/Kubernetes liveness probes. This endpoint is
-        exempt from API token authentication so probes need no credentials.
+        Suitable for Docker/Kubernetes liveness probes. `GET` and `HEAD`
+        are exempt from API token authentication so probes need no
+        credentials. Every other method except the shared `OPTIONS`
+        preflight gets `405` with `Allow: GET, HEAD`, whether or not it
+        carries a token.
 
         **Note:** This endpoint is custom to this fork and not available in upstream gstd.
       operationId: getHealth
@@ -115,6 +118,30 @@ paths:
                 description: OK
                 response:
                   status: healthy
+        '405':
+          description: Any method other than GET, HEAD, or OPTIONS
+          headers:
+            Allow:
+              schema:
+                type: string
+                enum:
+                  - GET, HEAD
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    head:
+      tags:
+        - Health
+      summary: Health check endpoint (headers only)
+      description: |
+        Same as `GET /health` without a response body, and likewise exempt
+        from API token authentication.
+      operationId: headHealth
+      security: []
+      responses:
+        '200':
+          description: The HTTP server is up and serving requests
 
   /pipelines/status:
     get:
@@ -1235,7 +1262,7 @@ components:
       scheme: bearer
       description: >-
         Enforced only when the daemon was started with `--http-api-token`
-        or `GSTD_HTTP_API_TOKEN`. `GET /health` never requires it.
+        or `GSTD_HTTP_API_TOKEN`. `GET` and `HEAD /health` never require it.
 
   responses:
     Unauthorized:

@@ -33,7 +33,7 @@ opt-in hardening on top of that:
 - **HTTP API token** — `--http-api-token <token>` or the
   `GSTD_HTTP_API_TOKEN` environment variable (preferred, since command
   lines are visible to other local processes). When set, every HTTP
-  request except `GET /health` must carry an
+  request except `GET`/`HEAD /health` must carry an
   `Authorization: Bearer <token>` header.
 - **CORS disabled by default** — the server no longer sends
   `Access-Control-Allow-Origin: *`, so web pages in a local browser

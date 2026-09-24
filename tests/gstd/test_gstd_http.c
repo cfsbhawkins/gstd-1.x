@@ -958,6 +958,68 @@ GST_START_TEST (test_http_body_within_limit)
 }
 GST_END_TEST;
 
+/*
+ * Test: with bearer auth enabled, only GET and HEAD on /health skip
+ * authentication; every other method gets 405 and never the health body
+ */
+GST_START_TEST (test_http_health_method_matrix)
+{
+  static const gchar *refused[] = { "POST", "PUT", "DELETE", "PATCH",
+    "TRACE", "PROPFIND", NULL
+  };
+  GstdReturnCode ret;
+  gchar *response;
+  gchar *raw = NULL;
+  guint status_code;
+  guint i;
+
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_get ("/health", &status_code);
+  fail_if (status_code != 200, "GET /health returned %u", status_code);
+  fail_if (strstr (response, "healthy") == NULL);
+  g_free (response);
+
+  response = http_request ("HEAD", "/health", NULL, &status_code, NULL);
+  fail_if (status_code != 200, "HEAD /health returned %u", status_code);
+  fail_if (response[0] != '\0', "HEAD /health must not carry a body");
+  g_free (response);
+
+  for (i = 0; refused[i]; i++) {
+    /* Unauthenticated and authenticated alike: the method is refused */
+    response = http_request (refused[i], "/health", NULL, &status_code,
+        &raw);
+    fail_if (status_code != 405, "%s /health returned %u, expected 405",
+        refused[i], status_code);
+    fail_if (strstr (response, "healthy") != NULL,
+        "%s /health must not return the health response", refused[i]);
+    fail_if (strstr (raw, "Allow: GET, HEAD") == NULL,
+        "%s /health 405 should advertise Allow: GET, HEAD", refused[i]);
+    g_free (response);
+    g_free (raw);
+
+    response = http_request (refused[i], "/health",
+        "Authorization: Bearer test-secret-token", &status_code, NULL);
+    fail_if (status_code != 405,
+        "Authenticated %s /health returned %u, expected 405", refused[i],
+        status_code);
+    g_free (response);
+  }
+
+  /* OPTIONS is the shared, empty CORS preflight, not the health body */
+  response = http_request ("OPTIONS", "/health", NULL, &status_code, NULL);
+  fail_if (status_code != 200, "OPTIONS /health returned %u", status_code);
+  fail_if (strstr (response, "healthy") != NULL,
+      "OPTIONS /health must not return the health response");
+  g_free (response);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -988,6 +1050,7 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_fast_path_body_too_large);
   tcase_add_test (tc, test_http_declared_length_too_large);
   tcase_add_test (tc, test_http_body_within_limit);
+  tcase_add_test (tc, test_http_health_method_matrix);
 
   return suite;
 }

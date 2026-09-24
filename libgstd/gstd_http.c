@@ -487,6 +487,33 @@ respond_unauthorized (GstdHttp * self, SoupMsg * msg)
 #endif
 }
 
+/* 405 with the methods the endpoint accepts in Allow (RFC 9110 15.5.6) */
+static void
+respond_method_not_allowed (SoupMsg * msg, const gchar * allowed)
+{
+  static const char *method_error =
+      "{ \"code\": 1, \"description\": \"Method not allowed\","
+      " \"response\": null }";
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+  soup_message_headers_replace (response_headers, "Allow", allowed);
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+  soup_server_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+  soup_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+#endif
+}
+
 /*
  * A resource name travels inside the space-separated parser command
  * language, so whitespace or control characters in it would be
@@ -877,7 +904,7 @@ handle_health_request (GstdHttp * self, SoupServer * server,
   response_headers = msg->response_headers;
 #endif
 
-  add_cors_headers (self, response_headers, "GET");
+  add_cors_headers (self, response_headers, "GET, HEAD");
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
@@ -1557,19 +1584,25 @@ server_callback (SoupServer * server, SoupMessage * msg,
   self = GSTD_HTTP (data);
   session = self->session;
 
-  /* Fast path for health checks - bypass thread pool. Exempt from
-   * authentication so container liveness probes need no credentials;
-   * it exposes nothing but the fact that the server responds. */
-  if (g_strcmp0 (path, "/health") == 0) {
-    handle_health_request (self, server, msg);
-    return;
-  }
-
 #if SOUP_CHECK_VERSION(3,0,0)
   method = soup_server_message_get_method (msg);
 #else
   method = msg->method;
 #endif
+
+  /* Fast path for health checks - bypass thread pool. GET and HEAD are
+   * exempt from authentication so container liveness probes need no
+   * credentials; they expose nothing but the fact that the server
+   * responds. Every other method is refused here, so the exemption never
+   * extends to a write; OPTIONS falls through to the shared preflight. */
+  if (g_strcmp0 (path, "/health") == 0 && method != SOUP_METHOD_OPTIONS) {
+    if (method == SOUP_METHOD_GET || method == SOUP_METHOD_HEAD) {
+      handle_health_request (self, server, msg);
+    } else {
+      respond_method_not_allowed (msg, "GET, HEAD");
+    }
+    return;
+  }
 
   /* Answer CORS preflights centrally, before authentication (preflights
    * carry no credentials) and before any handler could run: an OPTIONS

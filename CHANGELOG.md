@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes are released, the remainder is discarded without buffering, and
   the connection closes after the response. `parse_json_body` now checks
   the content type and size before it flattens anything.
+- **`/health` auth exemption limited to read methods** (`gstd_http.c`).
+  `/health` was dispatched by path before the method was read and before
+  bearer auth, and the handler ignored the method, so any verb got an
+  unauthenticated `200`. Only `GET` and `HEAD` are exempt now. Every
+  other method gets `405` with `Allow: GET, HEAD`, whether or not it
+  carries a token, and `OPTIONS` goes to the shared empty preflight.
 
 ### Fixed
 - **CI breakage** across the workflow matrix:
