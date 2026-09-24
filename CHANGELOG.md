@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **HTTP body limit enforced while the request is received**
+  (`gstd_http.c`). The 8 MiB cap used to be a `Content-Length` check
+  that ran after the fast paths, plus a length check after
+  `soup_message_body_flatten()`. A chunked body was therefore buffered and
+  flattened in full before it was checked, and fast-path or non-JSON
+  requests were never checked. The server now hooks every request on
+  `request-started`. A declared `Content-Length` over the cap is rejected
+  from the headers, so an `Expect: 100-continue` client never sends the
+  body. Chunked bodies are counted as they arrive and rejected once the
+  total passes the cap. Either way the request gets `413` for every
+  method, content type, and endpoint before any handler runs. Buffered
+  bytes are released, the remainder is discarded without buffering, and
+  the connection closes after the response. `parse_json_body` now checks
+  the content type and size before it flattens anything.
+- **`/health` auth exemption limited to read methods** (`gstd_http.c`).
+  `/health` was dispatched by path before the method was read and before
+  bearer auth, and the handler ignored the method, so any verb got an
+  unauthenticated `200`. Only `GET` and `HEAD` are exempt now. Every
+  other method gets `405` with `Allow: GET, HEAD`, whether or not it
+  carries a token, and `OPTIONS` goes to the shared empty preflight.
+- **An empty API token no longer disables authentication while
+  reporting it enabled** (`gstd_http.c`). `NULL` and `""` both skipped
+  auth, but startup logged it as enabled for any non-`NULL` value, so
+  `GSTD_HTTP_API_TOKEN=""` or `--http-api-token=` failed open. `NULL` is
+  now the only disabled state. An empty token from the environment or
+  the command line makes the HTTP server refuse to start. The
+  `api-token` property rejects `""` with a warning and keeps its
+  current value, and the request check fails closed if an empty token
+  ever reaches it.
+- **Wildcard and malformed CORS origins rejected** (`gstd_http.c`). The
+  configured origin was echoed verbatim, `*` was explicitly supported,
+  and the command line, environment, and property accepted any string.
+  The origin must now be exactly one serialized origin,
+  `http(s)://host[:port]` (lowercase, no default port). `*`, `null`,
+  paths, trailing slashes, queries, fragments, credentials, and lists
+  make the HTTP server refuse to start. The `cors-origin` property
+  rejects them with a warning and keeps its current value. `Vary: Origin`
+  is now always sent with the origin.
+- **Pipeline capacity reserved before the graph is built**
+  (`gstd_list.c`). `gstd_list_create` checked `max-children`, dropped the
+  lock, built the whole pipeline, and only enforced the cap again on
+  append. Parallel creates could therefore all pay the graph, memory,
+  and fd cost before being rejected. `GstdList` now reserves an
+  in-flight slot under the lock before construction. In-flight creates
+  count against the cap. A failed build or duplicate name releases the
+  slot, and success turns it into a child atomically. A concurrent-create
+  regression checks that at most `max-children` constructions ever run
+  at once.
+
 ### Fixed
 - **CI breakage** across the workflow matrix:
   - `gstd_action.c` / `gstd_http.c` mixed declarations failed

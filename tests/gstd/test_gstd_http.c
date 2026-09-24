@@ -214,6 +214,131 @@ http_get (const gchar * path, guint * status_code)
   return http_request ("GET", path, NULL, status_code, NULL);
 }
 
+/* Must match GSTD_HTTP_MAX_BODY_SIZE in gstd_http.c */
+#define TEST_MAX_BODY_SIZE (8 * 1024 * 1024)
+
+typedef enum
+{
+  BODY_CHUNKED,                 /* Transfer-Encoding: chunked */
+  BODY_FIXED,                   /* Content-Length, whole body sent */
+  BODY_EXPECT_CONTINUE          /* Content-Length + Expect: 100-continue,
+                                 * no body sent unless the server asks */
+} BodyMode;
+
+/*
+ * Send @body_size bytes of filler (or @body verbatim when non-NULL) as the
+ * request body of @method @request_target, then read the response status.
+ * Returns the response body; caller frees.
+ */
+static gchar *
+http_request_with_body (const gchar * method, const gchar * request_target,
+    const gchar * content_type, BodyMode mode, const gchar * body,
+    gsize body_size, guint * status_code)
+{
+  GSocketClient *client;
+  GSocketConnection *conn;
+  GInputStream *istream;
+  GOutputStream *ostream;
+  GError *error = NULL;
+  GString *head;
+  gchar *filler;
+  gchar *response;
+  gsize sent = 0;
+  gsize piece;
+  gssize bytes_read;
+  gsize total_read = 0;
+  gboolean ok = TRUE;
+  gchar buffer[8192];
+  const gsize piece_max = 64 * 1024;
+
+  *status_code = 0;
+  if (body) {
+    body_size = strlen (body);
+  }
+
+  client = g_socket_client_new ();
+  conn = g_socket_client_connect_to_host (client,
+      TEST_HTTP_ADDRESS, TEST_HTTP_PORT, NULL, &error);
+  if (!conn) {
+    g_clear_error (&error);
+    g_object_unref (client);
+    return NULL;
+  }
+
+  ostream = g_io_stream_get_output_stream (G_IO_STREAM (conn));
+  istream = g_io_stream_get_input_stream (G_IO_STREAM (conn));
+
+  head = g_string_new (NULL);
+  g_string_append_printf (head, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n",
+      method, request_target, TEST_HTTP_ADDRESS, TEST_HTTP_PORT);
+  g_string_append_printf (head, "Content-Type: %s\r\n", content_type);
+  if (mode == BODY_CHUNKED) {
+    g_string_append (head, "Transfer-Encoding: chunked\r\n");
+  } else {
+    g_string_append_printf (head, "Content-Length: %" G_GSIZE_FORMAT "\r\n",
+        body_size);
+  }
+  if (mode == BODY_EXPECT_CONTINUE) {
+    g_string_append (head, "Expect: 100-continue\r\n");
+  }
+  g_string_append (head, "Connection: close\r\n\r\n");
+
+  ok = g_output_stream_write_all (ostream, head->str, head->len, NULL, NULL,
+      NULL);
+  g_string_free (head, TRUE);
+
+  filler = g_malloc (piece_max);
+  memset (filler, 'a', piece_max);
+
+  while (ok && mode != BODY_EXPECT_CONTINUE && sent < body_size) {
+    const gchar *data = body ? body + sent : filler;
+
+    piece = MIN (piece_max, body_size - sent);
+    if (mode == BODY_CHUNKED) {
+      gchar *size_line = g_strdup_printf ("%" G_GSIZE_MODIFIER "x\r\n", piece);
+
+      ok = g_output_stream_write_all (ostream, size_line, strlen (size_line),
+          NULL, NULL, NULL);
+      g_free (size_line);
+    }
+    ok = ok && g_output_stream_write_all (ostream, data, piece, NULL, NULL,
+        NULL);
+    if (mode == BODY_CHUNKED) {
+      ok = ok && g_output_stream_write_all (ostream, "\r\n", 2, NULL, NULL,
+          NULL);
+    }
+    sent += piece;
+  }
+  if (ok && mode == BODY_CHUNKED) {
+    g_output_stream_write_all (ostream, "0\r\n\r\n", 5, NULL, NULL, NULL);
+  }
+  g_free (filler);
+
+  /* Connection: close, so read until EOF */
+  while (total_read < sizeof (buffer) - 1) {
+    bytes_read = g_input_stream_read (istream, buffer + total_read,
+        sizeof (buffer) - 1 - total_read, NULL, NULL);
+    if (bytes_read <= 0) {
+      break;
+    }
+    total_read += bytes_read;
+  }
+  buffer[total_read] = '\0';
+
+  if (sscanf (buffer, "HTTP/1.%*d %u", status_code) != 1) {
+    *status_code = 0;
+  }
+
+  response = strstr (buffer, "\r\n\r\n");
+  response = g_strdup (response ? response + 4 : "");
+
+  g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
+  g_object_unref (conn);
+  g_object_unref (client);
+
+  return response;
+}
+
 /*
  * Test: HTTP server starts successfully
  */
@@ -685,6 +810,479 @@ GST_START_TEST (test_http_unauthorized_carries_cors)
 }
 GST_END_TEST;
 
+/*
+ * Test: a chunked body (no Content-Length) past the limit is rejected
+ * with 413 while it is received, for JSON and non-JSON alike
+ */
+GST_START_TEST (test_http_chunked_body_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized chunked JSON returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("POST",
+      "/pipelines?name=p&description=fakesrc%20!%20fakesink", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized chunked text/plain returned %u, expected 413", status_code);
+  g_free (response);
+
+  /* The rejected create must not have run */
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (status_code != 200);
+  fail_if (strstr (response, "\"count\": 0") == NULL,
+      "An oversized request must not reach the handler: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: fast-path endpoints, which answer without the thread pool, are
+ * subject to the same limit
+ */
+GST_START_TEST (test_http_fast_path_body_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST",
+      "/pipelines/clock_sync?source=a&targets=b", "application/octet-stream",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized clock_sync body returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/pipelines/status",
+      "application/json", BODY_FIXED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized /pipelines/status body returned %u, expected 413",
+      status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/health", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized /health body returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("GET", "/elements/fakesrc", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized /elements body returned %u, expected 413", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: an oversized Content-Length is rejected from the headers alone,
+ * so a client using Expect: 100-continue never has to send the body
+ */
+GST_START_TEST (test_http_declared_length_too_large)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines", "text/plain",
+      BODY_EXPECT_CONTINUE, NULL, TEST_MAX_BODY_SIZE + 1, &status_code);
+  fail_if (status_code != 413,
+      "Oversized declared length returned %u, expected 413", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/p/state",
+      "application/json", BODY_FIXED, NULL, TEST_MAX_BODY_SIZE + 1,
+      &status_code);
+  fail_if (status_code != 413,
+      "Oversized fixed-length body returned %u, expected 413", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: bodies within the limit still work, chunked or not
+ */
+GST_START_TEST (test_http_body_within_limit)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_CHUNKED,
+      "{\"name\": \"chunked_pipe\", \"description\": \"fakesrc ! fakesink\"}",
+      0, &status_code);
+  fail_if (status_code != 200,
+      "Chunked JSON create returned %u, expected 200", status_code);
+  g_free (response);
+
+  /* Exactly at the limit is allowed */
+  response = http_request_with_body ("GET", "/health", "text/plain",
+      BODY_CHUNKED, NULL, TEST_MAX_BODY_SIZE, &status_code);
+  fail_if (status_code != 200,
+      "Body at the limit returned %u, expected 200", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (strstr (response, "chunked_pipe") == NULL,
+      "Chunked JSON create did not create the pipeline: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: with bearer auth enabled, only GET and HEAD on /health skip
+ * authentication; every other method gets 405 and never the health body
+ */
+GST_START_TEST (test_http_health_method_matrix)
+{
+  static const gchar *refused[] = { "POST", "PUT", "DELETE", "PATCH",
+    "TRACE", "PROPFIND", NULL
+  };
+  GstdReturnCode ret;
+  gchar *response;
+  gchar *raw = NULL;
+  guint status_code;
+  guint i;
+
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_get ("/health", &status_code);
+  fail_if (status_code != 200, "GET /health returned %u", status_code);
+  fail_if (strstr (response, "healthy") == NULL);
+  g_free (response);
+
+  response = http_request ("HEAD", "/health", NULL, &status_code, NULL);
+  fail_if (status_code != 200, "HEAD /health returned %u", status_code);
+  fail_if (response[0] != '\0', "HEAD /health must not carry a body");
+  g_free (response);
+
+  for (i = 0; refused[i]; i++) {
+    /* Unauthenticated and authenticated alike: the method is refused */
+    response = http_request (refused[i], "/health", NULL, &status_code,
+        &raw);
+    fail_if (status_code != 405, "%s /health returned %u, expected 405",
+        refused[i], status_code);
+    fail_if (strstr (response, "healthy") != NULL,
+        "%s /health must not return the health response", refused[i]);
+    fail_if (strstr (raw, "Allow: GET, HEAD") == NULL,
+        "%s /health 405 should advertise Allow: GET, HEAD", refused[i]);
+    g_free (response);
+    g_free (raw);
+
+    response = http_request (refused[i], "/health",
+        "Authorization: Bearer test-secret-token", &status_code, NULL);
+    fail_if (status_code != 405,
+        "Authenticated %s /health returned %u, expected 405", refused[i],
+        status_code);
+    g_free (response);
+  }
+
+  /* OPTIONS is the shared, empty CORS preflight, not the health body */
+  response = http_request ("OPTIONS", "/health", NULL, &status_code, NULL);
+  fail_if (status_code != 200, "OPTIONS /health returned %u", status_code);
+  fail_if (strstr (response, "healthy") != NULL,
+      "OPTIONS /health must not return the health response");
+  g_free (response);
+}
+GST_END_TEST;
+
+/* Feed @argv through the HTTP option group, as the daemon does */
+static void
+parse_http_options (gint argc, gchar ** argv)
+{
+  GOptionContext *context;
+  GOptionGroup *group = NULL;
+  GError *error = NULL;
+  gboolean parsed;
+
+  gstd_ipc_get_option_group (GSTD_IPC (test_http), &group);
+  fail_if (NULL == group);
+
+  context = g_option_context_new (NULL);
+  g_option_context_add_group (context, group);
+  parsed = g_option_context_parse (context, &argc, &argv, &error);
+  fail_if (!parsed, "Option parsing failed: %s",
+      error ? error->message : "unknown");
+  g_option_context_free (context);
+}
+
+/*
+ * Test: an explicitly empty token in the environment is refused at
+ * startup instead of silently disabling authentication
+ */
+GST_START_TEST (test_http_empty_token_env_rejected)
+{
+  GstdReturnCode ret;
+
+  g_setenv ("GSTD_HTTP_API_TOKEN", "", TRUE);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  g_unsetenv ("GSTD_HTTP_API_TOKEN");
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an empty GSTD_HTTP_API_TOKEN");
+}
+GST_END_TEST;
+
+/*
+ * Test: --http-api-token= (empty) is refused at startup
+ */
+GST_START_TEST (test_http_empty_token_cli_rejected)
+{
+  GstdReturnCode ret;
+  gchar *argv[] = { (gchar *) "gstd", (gchar *) "--http-api-token=", NULL };
+
+  parse_http_options (2, argv);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an empty --http-api-token");
+}
+GST_END_TEST;
+
+/*
+ * Test: a non-empty token from the command line still enables auth
+ */
+GST_START_TEST (test_http_token_cli_accepted)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+  gchar *argv[] = { (gchar *) "gstd",
+    (gchar *) "--http-api-token=cli-token", NULL
+  };
+
+  parse_http_options (2, argv);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 401, "Expected 401, got %u", status_code);
+  g_free (response);
+
+  response = http_request ("GET", "/pipelines",
+      "Authorization: Bearer cli-token", &status_code, NULL);
+  fail_if (status_code != 200, "Expected 200, got %u", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: the api-token property refuses an empty string and keeps its
+ * current value, so a rotation to "" cannot disable authentication
+ */
+GST_START_TEST (test_http_empty_token_property_rejected)
+{
+  GstdReturnCode ret;
+  gchar *token = NULL;
+  gchar *response;
+  guint status_code;
+
+  /* From the default (disabled) state */
+  ASSERT_WARNING (g_object_set (test_http, "api-token", "", NULL));
+  g_object_get (test_http, "api-token", &token, NULL);
+  fail_if (token != NULL, "Empty token was stored: \"%s\"", token);
+
+  /* From a configured token: the rotation to "" is refused */
+  g_object_set (test_http, "api-token", "test-secret-token", NULL);
+  ASSERT_WARNING (g_object_set (test_http, "api-token", "", NULL));
+  g_object_get (test_http, "api-token", &token, NULL);
+  fail_if (g_strcmp0 (token, "test-secret-token") != 0,
+      "Token changed to \"%s\" after an empty assignment", token);
+  g_free (token);
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  /* Still enforced; an empty bearer credential does not match */
+  response = http_request ("GET", "/pipelines", "Authorization: Bearer ",
+      &status_code, NULL);
+  fail_if (status_code != 401, "Empty bearer returned %u, expected 401",
+      status_code);
+  g_free (response);
+
+  /* NULL remains the explicit way to disable authentication */
+  g_object_set (test_http, "api-token", NULL, NULL);
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 200, "Expected 200 once disabled, got %u",
+      status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
+/* Origins that are not exactly one concrete serialized http(s) origin */
+static const gchar *invalid_cors_origins[] = {
+  "*",
+  "",
+  "null",
+  "example.com",
+  "ftp://example.com",
+  "http://",
+  "http://example.com/",
+  "http://example.com/app",
+  "http://example.com?x=1",
+  "http://example.com#top",
+  "http://user@example.com",
+  "http://user:pass@example.com",
+  "http://a.example.com,http://b.example.com",
+  "http://a.example.com http://b.example.com",
+  "http://example.com\r\nX-Injected: 1",
+  "HTTP://example.com",
+  "http://Example.com",
+  "http://*.example.com",
+  "http://example..com",
+  "http://.example.com",
+  "http://example.com.",
+  "http://example.com:",
+  "http://example.com:0",
+  "http://example.com:080",
+  "http://example.com:65536",
+  "http://example.com:8080x",
+  "http://example.com:80",
+  "https://example.com:443",
+  "http://[::1",
+  "http://[zz::1]",
+  "http://[127.0.0.1]",
+  "http://[::1]x",
+  NULL
+};
+
+/*
+ * Test: the cors-origin property refuses wildcard and malformed origins
+ * and keeps its current value; concrete origins are accepted
+ */
+GST_START_TEST (test_http_cors_origin_property_validation)
+{
+  static const gchar *valid[] = {
+    "http://example.com",
+    "https://ui.example.com:8443",
+    "http://127.0.0.1:3000",
+    "http://[::1]:8080",
+    "http://localhost",
+    "https://example.com:80",
+    NULL
+  };
+  gchar *origin = NULL;
+  guint i;
+
+  for (i = 0; invalid_cors_origins[i]; i++) {
+    ASSERT_WARNING (g_object_set (test_http, "cors-origin",
+            invalid_cors_origins[i], NULL));
+    g_object_get (test_http, "cors-origin", &origin, NULL);
+    fail_if (origin != NULL, "Invalid origin \"%s\" was stored",
+        invalid_cors_origins[i]);
+  }
+
+  for (i = 0; valid[i]; i++) {
+    g_object_set (test_http, "cors-origin", valid[i], NULL);
+    g_object_get (test_http, "cors-origin", &origin, NULL);
+    fail_if (g_strcmp0 (origin, valid[i]) != 0,
+        "Valid origin \"%s\" was not stored", valid[i]);
+    g_free (origin);
+  }
+
+  /* A rejected assignment keeps the configured origin */
+  g_object_set (test_http, "cors-origin", "http://example.com", NULL);
+  ASSERT_WARNING (g_object_set (test_http, "cors-origin", "*", NULL));
+  g_object_get (test_http, "cors-origin", &origin, NULL);
+  fail_if (g_strcmp0 (origin, "http://example.com") != 0,
+      "Origin changed to \"%s\" after a rejected assignment", origin);
+  g_free (origin);
+
+  /* NULL still disables CORS */
+  g_object_set (test_http, "cors-origin", NULL, NULL);
+  g_object_get (test_http, "cors-origin", &origin, NULL);
+  fail_if (origin != NULL);
+}
+GST_END_TEST;
+
+/*
+ * Test: a wildcard or malformed GSTD_HTTP_CORS_ORIGIN is refused at startup
+ */
+GST_START_TEST (test_http_cors_origin_env_rejected)
+{
+  GstdReturnCode ret;
+  guint i;
+
+  for (i = 0; invalid_cors_origins[i]; i++) {
+    g_setenv ("GSTD_HTTP_CORS_ORIGIN", invalid_cors_origins[i], TRUE);
+
+    ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+    fail_if (ret == GSTD_EOK,
+        "HTTP server started with GSTD_HTTP_CORS_ORIGIN=\"%s\"",
+        invalid_cors_origins[i]);
+
+    /* The env value is only a fallback for an unset origin: clear it so
+     * the next iteration reads the environment again */
+    g_object_set (test_http, "cors-origin", NULL, NULL);
+  }
+  g_unsetenv ("GSTD_HTTP_CORS_ORIGIN");
+}
+GST_END_TEST;
+
+/*
+ * Test: --http-cors-origin=* and a path-bearing origin are refused at
+ * startup
+ */
+GST_START_TEST (test_http_cors_origin_cli_rejected)
+{
+  GstdReturnCode ret;
+  gchar *wildcard[] = { (gchar *) "gstd", (gchar *) "--http-cors-origin=*",
+    NULL
+  };
+  gchar *with_path[] = { (gchar *) "gstd",
+    (gchar *) "--http-cors-origin=http://example.com/app", NULL
+  };
+
+  parse_http_options (2, wildcard);
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK, "HTTP server started with --http-cors-origin=*");
+
+  parse_http_options (2, with_path);
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret == GSTD_EOK,
+      "HTTP server started with an origin carrying a path");
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -711,6 +1309,18 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_pipeline_cap_returns_429);
   tcase_add_test (tc, test_http_rejects_path_with_whitespace);
   tcase_add_test (tc, test_http_unauthorized_carries_cors);
+  tcase_add_test (tc, test_http_chunked_body_too_large);
+  tcase_add_test (tc, test_http_fast_path_body_too_large);
+  tcase_add_test (tc, test_http_declared_length_too_large);
+  tcase_add_test (tc, test_http_body_within_limit);
+  tcase_add_test (tc, test_http_health_method_matrix);
+  tcase_add_test (tc, test_http_empty_token_env_rejected);
+  tcase_add_test (tc, test_http_empty_token_cli_rejected);
+  tcase_add_test (tc, test_http_token_cli_accepted);
+  tcase_add_test (tc, test_http_empty_token_property_rejected);
+  tcase_add_test (tc, test_http_cors_origin_property_validation);
+  tcase_add_test (tc, test_http_cors_origin_env_rejected);
+  tcase_add_test (tc, test_http_cors_origin_cli_rejected);
 
   return suite;
 }

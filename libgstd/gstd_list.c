@@ -125,6 +125,7 @@ gstd_list_init (GstdList * self)
   self->count = GSTD_LIST_DEFAULT_COUNT;
   self->node_type = GSTD_LIST_DEFAULT_NODE_TYPE;
   self->max_children = GSTD_LIST_DEFAULT_MAX_CHILDREN;
+  self->reserved = 0;
 }
 
 static void
@@ -217,12 +218,56 @@ gstd_list_find_node (gconstpointer _obj, gconstpointer _name)
   return strcmp (GSTD_OBJECT_NAME (obj), name);
 }
 
+/* Caller holds the object lock. Slots reserved by in-flight creates
+ * count as taken. */
+static gboolean
+gstd_list_is_full (GstdList * self)
+{
+  return self->max_children > 0
+      && self->count + self->reserved >= self->max_children;
+}
+
+/*
+ * Turn a reservation taken by gstd_list_create into a child, atomically
+ * under the lock. The reservation is consumed either way; FALSE means the
+ * name already exists. A granted reservation is honored even if
+ * max-children was lowered meanwhile, like the children that already
+ * exist.
+ */
+static gboolean
+gstd_list_commit_reserved (GstdList * self, GstdObject * child)
+{
+  GList *found;
+
+  GST_OBJECT_LOCK (self);
+  g_warn_if_fail (self->reserved > 0);
+  self->reserved--;
+
+  found =
+      g_list_find_custom (self->list, GSTD_OBJECT_NAME (child),
+      gstd_list_find_node);
+  if (found) {
+    GST_OBJECT_UNLOCK (self);
+    GST_ERROR_OBJECT (self, "The resource \"%s\" already exists in \"%s\"",
+        GSTD_OBJECT_NAME (child), GSTD_OBJECT_NAME (self));
+    return FALSE;
+  }
+
+  self->list = g_list_append (self->list, child);
+  self->count = g_list_length (self->list);
+  GST_OBJECT_UNLOCK (self);
+  GST_INFO_OBJECT (self, "Appended %s to %s list", GSTD_OBJECT_NAME (child),
+      GSTD_OBJECT_NAME (self));
+
+  return TRUE;
+}
+
 static GstdReturnCode
 gstd_list_create (GstdObject * object, const gchar * name,
     const gchar * description)
 {
   GstdList *self;
-  GstdObject *out;
+  GstdObject *out = NULL;
   GstdReturnCode ret = GSTD_EOK;
 
   g_return_val_if_fail (GSTD_IS_OBJECT (object), GSTD_NULL_ARGUMENT);
@@ -231,18 +276,20 @@ gstd_list_create (GstdObject * object, const gchar * name,
 
   g_return_val_if_fail (object->creator, GSTD_MISSING_INITIALIZATION);
 
-  /* Cheap rejection before constructing the resource. The authoritative
-   * check runs under the lock in gstd_list_append_child; this one exists
-   * to give the client a precise error and to avoid building a resource
-   * that would be thrown away. */
+  /* Reserve a slot before constructing the resource. Building a pipeline
+   * parses the description and instantiates the whole graph (memory,
+   * threads, file descriptors), so the capacity decision is made under
+   * the lock before that cost is paid: in-flight creates count against
+   * max-children just like existing children. */
   GST_OBJECT_LOCK (self);
-  if (self->max_children > 0 && self->count >= self->max_children) {
+  if (gstd_list_is_full (self)) {
     GST_OBJECT_UNLOCK (self);
     GST_ERROR_OBJECT (object,
         "Cannot create \"%s\": \"%s\" reached its limit of %u resources",
         name, GSTD_OBJECT_NAME (self), self->max_children);
     return GSTD_MAX_LIMIT_REACHED;
   }
+  self->reserved++;
   GST_OBJECT_UNLOCK (self);
 
   ret = gstd_icreator_create (object->creator, name, description, &out);
@@ -254,30 +301,21 @@ gstd_list_create (GstdObject * object, const gchar * name,
     goto error;
   }
 
-  /* Note: gstd_list_append_child updates count inside its lock,
-   * so we don't increment count here to avoid race condition */
-  if (!gstd_list_append_child (self, out)) {
-    gboolean at_capacity;
-
-    /* The append fails for a duplicate name or a full list; report the
-     * right error. A concurrent create that raced past the pre-check
-     * above lands here when it loses, and must still surface as a
-     * limit rejection, not "already exists". */
-    GST_OBJECT_LOCK (self);
-    at_capacity = self->max_children > 0
-        && self->count >= self->max_children
-        && NULL == g_list_find_custom (self->list, GSTD_OBJECT_NAME (out),
-        gstd_list_find_node);
-    GST_OBJECT_UNLOCK (self);
-
+  /* Consumes the reservation; fails only for a duplicate name */
+  if (!gstd_list_commit_reserved (self, out)) {
     g_object_unref (out);
-    ret = at_capacity ? GSTD_MAX_LIMIT_REACHED : GSTD_EXISTING_RESOURCE;
-    return ret;
+    return GSTD_EXISTING_RESOURCE;
   }
 
   return ret;
 error:
   {
+    /* Construction failed: give the slot back */
+    GST_OBJECT_LOCK (self);
+    g_warn_if_fail (self->reserved > 0);
+    self->reserved--;
+    GST_OBJECT_UNLOCK (self);
+
     if (out)
       g_object_unref (out);
 
@@ -423,10 +461,9 @@ gstd_list_append_child (GstdList * self, GstdObject * child)
     goto exists;
   }
 
-  /* Authoritative capacity check: gstd_list_create pre-checks without
-   * holding the lock across resource construction, so concurrent creates
-   * can race past it and must be rejected here. */
-  if (self->max_children > 0 && self->count >= self->max_children) {
+  /* Direct appends (not through gstd_list_create) must also respect
+   * slots reserved by in-flight creates */
+  if (gstd_list_is_full (self)) {
     GST_OBJECT_UNLOCK (self);
     GST_ERROR_OBJECT (self,
         "Cannot append \"%s\": \"%s\" reached its limit of %u resources",

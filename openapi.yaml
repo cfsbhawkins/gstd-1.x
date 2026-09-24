@@ -8,27 +8,40 @@ info:
     properties over HTTP. All responses follow a consistent JSON envelope format.
 
     Request bodies larger than 8 MiB are rejected with `413 Request Entity Too
-    Large`; pipeline descriptions and property values are well within this
-    bound, so normal clients are unaffected.
+    Large` on every endpoint, for every method and content type, whether
+    the size is declared with `Content-Length` or the body is sent chunked.
+    The limit is enforced while the body is received, before the request
+    is dispatched. An oversized declared length is rejected from the
+    headers alone (a client sending `Expect: 100-continue` never has to
+    send the body), and the connection is closed after the `413`.
+    Pipeline descriptions and property values are well within this bound,
+    so normal clients are unaffected.
 
     ## Authentication (fork-specific, opt-in)
 
     When the daemon is started with `--http-api-token <token>` or the
     `GSTD_HTTP_API_TOKEN` environment variable (preferred, since command
     lines are visible to other local processes), every request except
-    `GET /health` must carry an `Authorization: Bearer <token>` header.
+    `GET`/`HEAD /health` must carry an `Authorization: Bearer <token>` header.
     Requests without a valid token receive `401` with a
     `WWW-Authenticate: Bearer` header. `OPTIONS` preflights are answered
     with an empty `200` and are never dispatched to any endpoint.
     By default (no token configured) the API is unauthenticated,
-    matching upstream gstd.
+    matching upstream gstd. A token that is set but empty
+    (`GSTD_HTTP_API_TOKEN=` or `--http-api-token=`) is rejected at startup,
+    so authentication can only be disabled by leaving it unset.
 
     ## CORS (fork-specific, opt-in)
 
     No CORS headers are emitted unless the daemon is started with
     `--http-cors-origin <origin>` or `GSTD_HTTP_CORS_ORIGIN`, so browser
-    pages cannot read API responses cross-origin by default. A configured
-    non-wildcard origin is echoed with `Vary: Origin`.
+    pages cannot read API responses cross-origin by default. The value
+    must be exactly one serialized origin, `http(s)://host[:port]` in
+    lowercase with no default port (for example `https://ui.example.com`
+    or `http://127.0.0.1:8080`). A wildcard (`*`), `null`, a path or
+    trailing slash, a query, a fragment, credentials, or a list is rejected
+    when the daemon starts. The configured origin is echoed with
+    `Vary: Origin`.
 
     ## Input validation (fork-specific)
 
@@ -36,6 +49,8 @@ info:
     must not contain whitespace or control characters; offending requests
     are rejected with `400`. A configured pipeline cap (`--max-pipelines`
     or `GSTD_MAX_PIPELINES`) rejects creates past the limit with `429`.
+    Pipelines still being built count against the cap, so a rejected
+    create never constructs its pipeline.
 
     For additional documentation, see the official RidgeRun wiki:
     https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
@@ -91,8 +106,11 @@ paths:
         stuck pipeline; it answers on a fast path that bypasses the request
         thread pool.
 
-        Suitable for Docker/Kubernetes liveness probes. This endpoint is
-        exempt from API token authentication so probes need no credentials.
+        Suitable for Docker/Kubernetes liveness probes. `GET` and `HEAD`
+        are exempt from API token authentication so probes need no
+        credentials. Every other method except the shared `OPTIONS`
+        preflight gets `405` with `Allow: GET, HEAD`, whether or not it
+        carries a token.
 
         **Note:** This endpoint is custom to this fork and not available in upstream gstd.
       operationId: getHealth
@@ -109,6 +127,30 @@ paths:
                 description: OK
                 response:
                   status: healthy
+        '405':
+          description: Any method other than GET, HEAD, or OPTIONS
+          headers:
+            Allow:
+              schema:
+                type: string
+                enum:
+                  - GET, HEAD
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    head:
+      tags:
+        - Health
+      summary: Health check endpoint (headers only)
+      description: |
+        Same as `GET /health` without a response body, and likewise exempt
+        from API token authentication.
+      operationId: headHealth
+      security: []
+      responses:
+        '200':
+          description: The HTTP server is up and serving requests
 
   /pipelines/status:
     get:
@@ -1229,7 +1271,7 @@ components:
       scheme: bearer
       description: >-
         Enforced only when the daemon was started with `--http-api-token`
-        or `GSTD_HTTP_API_TOKEN`. `GET /health` never requires it.
+        or `GSTD_HTTP_API_TOKEN`. `GET` and `HEAD /health` never require it.
 
   responses:
     Unauthorized:

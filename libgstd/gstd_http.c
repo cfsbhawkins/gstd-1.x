@@ -40,9 +40,11 @@ GST_DEBUG_CATEGORY_STATIC (gstd_http_debug);
 
 #define GSTD_DEBUG_DEFAULT_LEVEL GST_LEVEL_INFO
 
-/* Upper bound on the request body we are willing to parse. Pipeline
+/* Upper bound on the request body we are willing to buffer. Pipeline
  * descriptions and property values are small, so a generous cap is safe for
- * every client while bounding the work done on a hostile oversized request. */
+ * every client while bounding the memory a hostile request can pin. It is
+ * enforced while the body is received (see request_started_cb), before any
+ * handler runs. */
 #define GSTD_HTTP_MAX_BODY_SIZE (8 * 1024 * 1024)
 
 #if SOUP_CHECK_VERSION(3,0,0)
@@ -164,14 +166,14 @@ gstd_http_class_init (GstdHttpClass * klass)
 
   properties[PROP_API_TOKEN] =
       g_param_spec_string ("api-token", "API token",
-      "Bearer token required on every request except /health "
-      "(NULL disables authentication)",
+      "Bearer token required on every request except GET/HEAD /health "
+      "(NULL disables authentication; an empty string is rejected)",
       NULL, G_PARAM_READWRITE);
 
   properties[PROP_CORS_ORIGIN] =
       g_param_spec_string ("cors-origin", "CORS origin",
-      "Origin allowed in CORS response headers "
-      "(NULL emits no CORS headers)",
+      "Origin allowed in CORS response headers: one http(s)://host[:port] "
+      "origin, never \"*\" (NULL emits no CORS headers)",
       NULL, G_PARAM_READWRITE);
 
   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
@@ -200,6 +202,111 @@ gstd_http_init (GstdHttp * self)
 
 }
 
+/* NULL disables authentication; any other value must be a usable token */
+static gboolean
+api_token_is_valid (const gchar * token)
+{
+  return token == NULL || token[0] != '\0';
+}
+
+/*
+ * A CORS origin must be exactly one concrete serialized origin, as a
+ * browser sends it in the Origin header and compares it byte for byte
+ * against Access-Control-Allow-Origin: http or https, a lowercase host
+ * (DNS name, IPv4, or bracketed IPv6) and an optional non-default port,
+ * nothing else. That rules out "*", "null", paths (including a trailing
+ * slash), queries, fragments, credentials, and lists. NULL disables CORS.
+ */
+static gboolean
+cors_origin_is_valid (const gchar * origin)
+{
+  const gchar *host = NULL;
+  const gchar *host_end = NULL;
+  const gchar *port = NULL;
+  const gchar *c = NULL;
+  gchar *literal = NULL;
+  gboolean https = FALSE;
+  gboolean valid = FALSE;
+  guint64 port_value = 0;
+
+  if (!origin) {
+    return TRUE;
+  }
+
+  if (g_str_has_prefix (origin, "http://")) {
+    host = origin + strlen ("http://");
+  } else if (g_str_has_prefix (origin, "https://")) {
+    host = origin + strlen ("https://");
+    https = TRUE;
+  } else {
+    return FALSE;
+  }
+
+  if (host[0] == '[') {
+    /* IPv6 literal */
+    host_end = strchr (host, ']');
+    if (!host_end) {
+      return FALSE;
+    }
+    literal = g_strndup (host + 1, host_end - host - 1);
+    valid = strchr (literal, ':') != NULL;
+    for (c = literal; valid && *c; c++) {
+      valid = g_ascii_isdigit (*c) || (*c >= 'a' && *c <= 'f')
+          || *c == ':' || *c == '.';
+    }
+    valid = valid && g_hostname_is_ip_address (literal);
+    g_free (literal);
+    if (!valid) {
+      return FALSE;
+    }
+    port = host_end + 1;
+  } else {
+    for (c = host; *c && *c != ':'; c++) {
+      if (!g_ascii_islower (*c) && !g_ascii_isdigit (*c) && *c != '-'
+          && *c != '.') {
+        return FALSE;
+      }
+    }
+    host_end = c;
+    if (host_end == host || host[0] == '.' || host[0] == '-'
+        || host_end[-1] == '.' || host_end[-1] == '-'
+        || g_strstr_len (host, host_end - host, "..")) {
+      return FALSE;
+    }
+    port = host_end;
+  }
+
+  if (port[0] == '\0') {
+    return TRUE;
+  }
+  if (port[0] != ':') {
+    return FALSE;
+  }
+  port++;
+
+  /* Serialized ports have no leading zero and omit the scheme default */
+  if (port[0] == '\0' || port[0] == '0' || strlen (port) > 5) {
+    return FALSE;
+  }
+  for (c = port; *c; c++) {
+    if (!g_ascii_isdigit (*c)) {
+      return FALSE;
+    }
+  }
+  port_value = g_ascii_strtoull (port, NULL, 10);
+  if (port_value > G_MAXUINT16 || (https && port_value == 443)
+      || (!https && port_value == 80)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+#define GSTD_HTTP_CORS_ORIGIN_HINT \
+  "a single origin such as https://ui.example.com or " \
+  "http://127.0.0.1:8080 (lowercase, no default port, no \"*\", path, " \
+  "trailing slash, query, fragment, credentials, or list)"
+
 static void
 gstd_http_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec)
@@ -218,6 +325,14 @@ gstd_http_set_property (GObject * object, guint property_id,
       self->max_threads = g_value_get_int (value);
       break;
     case PROP_API_TOKEN:
+      /* NULL is the only way to disable authentication: an empty token
+       * would read as "configured" while matching an empty credential,
+       * so refuse it and keep the current value */
+      if (!api_token_is_valid (g_value_get_string (value))) {
+        g_warning ("gstd: rejecting an empty HTTP API token; set NULL to "
+            "disable authentication");
+        break;
+      }
       /* Swapped under the lock: soup threads read it per request */
       g_mutex_lock (&self->mutex);
       g_free (self->api_token);
@@ -225,6 +340,12 @@ gstd_http_set_property (GObject * object, guint property_id,
       g_mutex_unlock (&self->mutex);
       break;
     case PROP_CORS_ORIGIN:
+      /* Refuse a wildcard or malformed origin and keep the current one */
+      if (!cors_origin_is_valid (g_value_get_string (value))) {
+        g_warning ("gstd: rejecting CORS origin \"%s\"; expected "
+            GSTD_HTTP_CORS_ORIGIN_HINT, g_value_get_string (value));
+        break;
+      }
       g_mutex_lock (&self->mutex);
       g_free (self->cors_origin);
       self->cors_origin = g_value_dup_string (value);
@@ -363,9 +484,9 @@ add_cors_headers (GstdHttp * self, SoupMessageHeaders * response_headers,
       "origin,range,content-type,authorization");
   soup_message_headers_append (response_headers,
       "Access-Control-Allow-Methods", methods);
-  if (g_strcmp0 (origin, "*") != 0) {
-    soup_message_headers_append (response_headers, "Vary", "Origin");
-  }
+  /* The origin is always one concrete origin (a wildcard is refused at
+   * configuration time), so caches must key on the request's Origin */
+  soup_message_headers_append (response_headers, "Vary", "Origin");
 
   g_free (origin);
 }
@@ -423,9 +544,13 @@ request_authorized (GstdHttp * self, SoupMsg * msg)
   token = g_strdup (self->api_token);
   g_mutex_unlock (&self->mutex);
 
-  if (!token || token[0] == '\0') {
-    g_free (token);
+  /* NULL is the only disabled state. An empty token is refused at
+   * configuration time; should one ever get here, fail closed. */
+  if (!token) {
     return TRUE;
+  }
+  if (token[0] == '\0') {
+    goto out;
   }
 #if SOUP_CHECK_VERSION(3,0,0)
   request_headers = soup_server_message_get_request_headers (msg);
@@ -482,6 +607,33 @@ respond_unauthorized (GstdHttp * self, SoupMsg * msg)
   soup_message_set_response (msg, "application/json",
       SOUP_MEMORY_STATIC, unauthorized, strlen (unauthorized));
   soup_message_set_status (msg, SOUP_STATUS_UNAUTHORIZED);
+#endif
+}
+
+/* 405 with the methods the endpoint accepts in Allow (RFC 9110 15.5.6) */
+static void
+respond_method_not_allowed (SoupMsg * msg, const gchar * allowed)
+{
+  static const char *method_error =
+      "{ \"code\": 1, \"description\": \"Method not allowed\","
+      " \"response\": null }";
+  SoupMessageHeaders *response_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  response_headers = soup_server_message_get_response_headers (msg);
+#else
+  response_headers = msg->response_headers;
+#endif
+  soup_message_headers_replace (response_headers, "Allow", allowed);
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+  soup_server_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, method_error, strlen (method_error));
+  soup_message_set_status (msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
 #endif
 }
 
@@ -780,7 +932,20 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   request_headers = msg->request_headers;
 #endif
 
-  if (!request_body) {
+  if (!request_body || request_body->length == 0) {
+    return;
+  }
+
+  /* Only JSON bodies carry parameters; never copy anything else */
+  content_type = soup_message_headers_get_content_type (request_headers, NULL);
+  if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
+    return;
+  }
+
+  /* The limit is enforced while the body is received, so an oversized
+   * request never reaches a handler; this guards the flatten below in
+   * case that invariant is ever broken. */
+  if (request_body->length > GSTD_HTTP_MAX_BODY_SIZE) {
     return;
   }
 
@@ -808,18 +973,6 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     return;
   }
 #endif
-
-  content_type = soup_message_headers_get_content_type (request_headers, NULL);
-
-  if (!content_type || !g_str_has_prefix (content_type, "application/json")) {
-    goto out;
-  }
-
-  /* Bound the work on an oversized body (defends chunked requests with no
-   * Content-Length, which the early check in server_callback cannot catch). */
-  if (body_length > GSTD_HTTP_MAX_BODY_SIZE) {
-    goto out;
-  }
 
   parser = json_parser_new ();
   if (!json_parser_load_from_data (parser, body_data, body_length, &err)) {
@@ -874,7 +1027,7 @@ handle_health_request (GstdHttp * self, SoupServer * server,
   response_headers = msg->response_headers;
 #endif
 
-  add_cors_headers (self, response_headers, "GET");
+  add_cors_headers (self, response_headers, "GET, HEAD");
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_STATIC,
@@ -1554,19 +1707,25 @@ server_callback (SoupServer * server, SoupMessage * msg,
   self = GSTD_HTTP (data);
   session = self->session;
 
-  /* Fast path for health checks - bypass thread pool. Exempt from
-   * authentication so container liveness probes need no credentials;
-   * it exposes nothing but the fact that the server responds. */
-  if (g_strcmp0 (path, "/health") == 0) {
-    handle_health_request (self, server, msg);
-    return;
-  }
-
 #if SOUP_CHECK_VERSION(3,0,0)
   method = soup_server_message_get_method (msg);
 #else
   method = msg->method;
 #endif
+
+  /* Fast path for health checks - bypass thread pool. GET and HEAD are
+   * exempt from authentication so container liveness probes need no
+   * credentials; they expose nothing but the fact that the server
+   * responds. Every other method is refused here, so the exemption never
+   * extends to a write; OPTIONS falls through to the shared preflight. */
+  if (g_strcmp0 (path, "/health") == 0 && method != SOUP_METHOD_OPTIONS) {
+    if (method == SOUP_METHOD_GET || method == SOUP_METHOD_HEAD) {
+      handle_health_request (self, server, msg);
+    } else {
+      respond_method_not_allowed (msg, "GET, HEAD");
+    }
+    return;
+  }
 
   /* Answer CORS preflights centrally, before authentication (preflights
    * carry no credentials) and before any handler could run: an OPTIONS
@@ -1679,34 +1838,9 @@ server_callback (SoupServer * server, SoupMessage * msg,
     return;
   }
 
-  /* Reject oversized request bodies up front (DoS guard). Pipeline
-   * descriptions and property values are small, so the cap never affects a
-   * legitimate client. */
-  {
-    SoupMessageHeaders *req_headers = NULL;
-    static const char *too_large =
-        "{ \"code\": 1, \"description\": \"Request body too large\","
-        " \"response\": null }";
-#if SOUP_CHECK_VERSION(3,0,0)
-    req_headers = soup_server_message_get_request_headers (msg);
-#else
-    req_headers = msg->request_headers;
-#endif
-    if (req_headers && soup_message_headers_get_content_length (req_headers) >
-        GSTD_HTTP_MAX_BODY_SIZE) {
-#if SOUP_CHECK_VERSION(3,0,0)
-      soup_server_message_set_response (msg, "application/json",
-          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
-      soup_server_message_set_status (msg,
-          SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE, NULL);
-#else
-      soup_message_set_response (msg, "application/json",
-          SOUP_MEMORY_STATIC, too_large, strlen (too_large));
-      soup_message_set_status (msg, SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE);
-#endif
-      return;
-    }
-  }
+  /* Oversized bodies never get here: request_started_cb rejects them with
+   * 413 while they are received, and libsoup skips every handler for a
+   * message that already carries a status. */
 
   data_request = g_new0 (GstdHttpRequest, 1);
 
@@ -1764,6 +1898,121 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
 }
 
+/*
+ * Reject a request whose body exceeds GSTD_HTTP_MAX_BODY_SIZE. Whatever
+ * was buffered is released and the rest of the body is discarded as it
+ * arrives instead of accumulated. Setting the status here makes libsoup
+ * skip every handler, and the connection is closed after the response so
+ * leftover body bytes can never be parsed as a new request.
+ */
+static void
+reject_oversized_request (GstdHttp * self, SoupMsg * msg)
+{
+  static const char *too_large =
+      "{ \"code\": 1, \"description\": \"Request body too large\","
+      " \"response\": null }";
+  SoupMessageBody *request_body = NULL;
+  SoupMessageHeaders *response_headers = NULL;
+  guint status = 0;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_body = soup_server_message_get_request_body (msg);
+  response_headers = soup_server_message_get_response_headers (msg);
+  status = soup_server_message_get_status (msg);
+#else
+  request_body = msg->request_body;
+  response_headers = msg->response_headers;
+  status = msg->status_code;
+#endif
+
+  soup_message_body_set_accumulate (request_body, FALSE);
+  soup_message_body_truncate (request_body);
+
+  /* libsoup may already have failed the request (e.g. a bad path); keep
+   * its status, it only needed the buffering stopped */
+  if (status != 0) {
+    return;
+  }
+
+  GST_WARNING_OBJECT (self, "Rejecting request body larger than %d bytes",
+      GSTD_HTTP_MAX_BODY_SIZE);
+
+  soup_message_headers_replace (response_headers, "Connection", "close");
+  add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  soup_server_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+  soup_server_message_set_status (msg,
+      SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE, NULL);
+#else
+  soup_message_set_response (msg, "application/json",
+      SOUP_MEMORY_STATIC, too_large, strlen (too_large));
+  soup_message_set_status (msg, SOUP_STATUS_REQUEST_ENTITY_TOO_LARGE);
+#endif
+}
+
+/* A declared Content-Length over the limit is rejected before any body
+ * byte is read; with "Expect: 100-continue" libsoup then skips the body */
+static void
+request_got_headers_cb (SoupMsg * msg, gpointer data)
+{
+  SoupMessageHeaders *request_headers = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_headers = soup_server_message_get_request_headers (msg);
+#else
+  request_headers = msg->request_headers;
+#endif
+
+  if (soup_message_headers_get_encoding (request_headers) ==
+      SOUP_ENCODING_CONTENT_LENGTH
+      && soup_message_headers_get_content_length (request_headers) >
+      GSTD_HTTP_MAX_BODY_SIZE) {
+    reject_oversized_request (GSTD_HTTP (data), msg);
+  }
+}
+
+/* Chunked (or otherwise unsized) bodies are counted as they arrive: the
+ * body accumulates, so its length is the running total */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+request_got_chunk_cb (SoupMsg * msg, GBytes * chunk, gpointer data)
+#else
+request_got_chunk_cb (SoupMsg * msg, SoupBuffer * chunk, gpointer data)
+#endif
+{
+  SoupMessageBody *request_body = NULL;
+
+#if SOUP_CHECK_VERSION(3,0,0)
+  request_body = soup_server_message_get_request_body (msg);
+#else
+  request_body = msg->request_body;
+#endif
+
+  if (request_body->length > GSTD_HTTP_MAX_BODY_SIZE) {
+    reject_oversized_request (GSTD_HTTP (data), msg);
+  }
+}
+
+/*
+ * Runs for every request before libsoup reads it, so the body limit is
+ * enforced for every method, content type, and endpoint (fast paths
+ * included) before any handler dispatch or body flattening.
+ */
+static void
+#if SOUP_CHECK_VERSION(3,0,0)
+request_started_cb (SoupServer * server, SoupMsg * msg, gpointer data)
+#else
+request_started_cb (SoupServer * server, SoupMsg * msg,
+    SoupClientContext * client, gpointer data)
+#endif
+{
+  g_signal_connect (msg, "got-headers",
+      G_CALLBACK (request_got_headers_cb), data);
+  g_signal_connect (msg, "got-chunk", G_CALLBACK (request_got_chunk_cb), data);
+}
+
 static GstdReturnCode
 gstd_http_start (GstdIpc * base, GstdSession * session)
 {
@@ -1792,6 +2041,25 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (NULL == self->cors_origin) {
     self->cors_origin = g_strdup (g_getenv ("GSTD_HTTP_CORS_ORIGIN"));
   }
+  /* The command line writes the field directly, bypassing the property
+   * check, and the environment is only read here: validate both. An
+   * explicitly empty token must not start a server that looks
+   * authenticated but is not. */
+  if (!api_token_is_valid (self->api_token)) {
+    g_mutex_unlock (&self->mutex);
+    GST_ERROR_OBJECT (self, "Refusing to start with an empty API token");
+    g_printerr ("gstd: The HTTP API token (--http-api-token or "
+        "GSTD_HTTP_API_TOKEN) is set but empty; set a token, or unset it "
+        "to run without authentication\n");
+    return GSTD_BAD_VALUE;
+  }
+  if (!cors_origin_is_valid (self->cors_origin)) {
+    g_mutex_unlock (&self->mutex);
+    GST_ERROR_OBJECT (self, "Refusing to start with an invalid CORS origin");
+    g_printerr ("gstd: Invalid HTTP CORS origin (--http-cors-origin or "
+        "GSTD_HTTP_CORS_ORIGIN); expected " GSTD_HTTP_CORS_ORIGIN_HINT "\n");
+    return GSTD_BAD_VALUE;
+  }
   if (self->api_token) {
     GST_INFO_OBJECT (self, "HTTP API token authentication enabled");
   }
@@ -1805,6 +2073,8 @@ gstd_http_start (GstdIpc * base, GstdSession * session)
   if (!self->server) {
     goto noconnection;
   }
+  g_signal_connect (self->server, "request-started",
+      G_CALLBACK (request_started_cb), self);
   self->pool =
       g_thread_pool_new (do_request, NULL, self->max_threads, FALSE, &error);
 
@@ -1879,14 +2149,15 @@ gstd_http_init_get_option_group (GstdIpc * base, GOptionGroup ** group)
     {"http-api-token", 0, 0, G_OPTION_ARG_STRING, &self->api_token,
           "Require this bearer token on every request except /health. "
           "Prefer the GSTD_HTTP_API_TOKEN environment variable: command "
-          "line arguments are visible to other local processes "
-          "(default: authentication disabled)",
+          "line arguments are visible to other local processes. An empty "
+          "value is rejected (default: authentication disabled)",
         "token"}
     ,
     {"http-cors-origin", 0, 0, G_OPTION_ARG_STRING, &self->cors_origin,
           "Origin allowed in CORS response headers, or GSTD_HTTP_CORS_ORIGIN "
-          "env var (default: no CORS headers, cross-origin browser access "
-          "disabled)",
+          "env var. Exactly one http(s)://host[:port] origin; \"*\", paths, "
+          "and lists are rejected (default: no CORS headers, cross-origin "
+          "browser access disabled)",
         "origin"}
     ,
     {NULL}
