@@ -11,6 +11,32 @@ info:
     Large`; pipeline descriptions and property values are well within this
     bound, so normal clients are unaffected.
 
+    ## Authentication (fork-specific, opt-in)
+
+    When the daemon is started with `--http-api-token <token>` or the
+    `GSTD_HTTP_API_TOKEN` environment variable (preferred, since command
+    lines are visible to other local processes), every request except
+    `GET /health` must carry an `Authorization: Bearer <token>` header.
+    Requests without a valid token receive `401` with a
+    `WWW-Authenticate: Bearer` header. `OPTIONS` preflights are answered
+    with an empty `200` and are never dispatched to any endpoint.
+    By default (no token configured) the API is unauthenticated,
+    matching upstream gstd.
+
+    ## CORS (fork-specific, opt-in)
+
+    No CORS headers are emitted unless the daemon is started with
+    `--http-cors-origin <origin>` or `GSTD_HTTP_CORS_ORIGIN`, so browser
+    pages cannot read API responses cross-origin by default. A configured
+    non-wildcard origin is echoed with `Vary: Origin`.
+
+    ## Input validation (fork-specific)
+
+    Percent-decoded request paths, and `name` values on POST and DELETE,
+    must not contain whitespace or control characters; offending requests
+    are rejected with `400`. A configured pipeline cap (`--max-pipelines`
+    or `GSTD_MAX_PIPELINES`) rejects creates past the limit with `429`.
+
     For additional documentation, see the official RidgeRun wiki:
     https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
   version: 0.16.2
@@ -24,6 +50,12 @@ info:
 servers:
   - url: http://localhost:5001
     description: Default gstd HTTP server
+
+# Bearer auth is enforced only when the daemon was started with an API
+# token; the empty alternative documents the (default) open configuration.
+security:
+  - bearerAuth: []
+  - {}
 
 tags:
   - name: Health
@@ -54,19 +86,20 @@ paths:
         - Health
       summary: Health check endpoint
       description: |
-        Health check that verifies GStreamer is responsive by creating and destroying
-        a canary pipeline (fakesrc ! fakesink). This proves the GStreamer runtime is
-        functional, not just that the HTTP server is up.
+        Simple liveness check: if the HTTP server responds, gstd is alive.
+        It deliberately makes no GStreamer calls, so it cannot hang behind a
+        stuck pipeline; it answers on a fast path that bypasses the request
+        thread pool.
 
-        Suitable for Docker/Kubernetes liveness probes. If GStreamer is deadlocked,
-        the endpoint will hang (triggering a container restart via timeout). If
-        GStreamer is broken but responsive, returns 503.
+        Suitable for Docker/Kubernetes liveness probes. This endpoint is
+        exempt from API token authentication so probes need no credentials.
 
         **Note:** This endpoint is custom to this fork and not available in upstream gstd.
       operationId: getHealth
+      security: []
       responses:
         '200':
-          description: Service is healthy and GStreamer is responsive
+          description: The HTTP server is up and serving requests
           content:
             application/json:
               schema:
@@ -76,17 +109,6 @@ paths:
                 description: OK
                 response:
                   status: healthy
-        '503':
-          description: GStreamer is unresponsive or broken
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UnhealthyResponse'
-              example:
-                code: 1
-                description: GStreamer unresponsive
-                response:
-                  status: unhealthy
 
   /pipelines/status:
     get:
@@ -102,9 +124,13 @@ paths:
         this endpoint is optimized for high-frequency status checks without causing
         server lockups under load.
 
+        Only GET is accepted; other methods receive `405`.
+
         **Note:** This endpoint is custom to this fork and not available in upstream gstd.
       operationId: getPipelinesStatus
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline status list
           content:
@@ -121,6 +147,12 @@ paths:
                     - name: backup_pipeline
                       state: PAUSED
                   count: 2
+        '405':
+          description: Method not allowed (only GET is accepted)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /pipelines/clock_sync:
     post:
@@ -164,6 +196,8 @@ paths:
             type: string
           example: my_output,my_preview,my_framegrab
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Clock and base_time synchronized successfully
           content:
@@ -235,6 +269,8 @@ paths:
             type: string
           example: v4l2convert
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Element factory exists in the registry
           content:
@@ -286,6 +322,8 @@ paths:
       description: Returns a list of all created pipelines
       operationId: listPipelines
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: List of pipelines
           content:
@@ -308,6 +346,8 @@ paths:
               name: mypipeline
               description: videotestsrc ! autovideosink
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline created successfully
           content:
@@ -315,7 +355,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/PipelineResponse'
         '400':
-          description: Bad pipeline description
+          description: >-
+            Bad pipeline description, or a name containing whitespace or
+            control characters
           content:
             application/json:
               schema:
@@ -332,6 +374,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: >-
+            The configured pipeline cap (`--max-pipelines` /
+            `GSTD_MAX_PIPELINES`) was reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: 19
+                description: Resource limit reached
+                response: null
 
   /pipelines/{pipeline_name}:
     parameters:
@@ -343,6 +397,8 @@ paths:
       description: Returns details about a specific pipeline
       operationId: getPipeline
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline details
           content:
@@ -374,12 +430,20 @@ paths:
                   type: string
                   description: Pipeline name to delete
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline deleted successfully
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: Name contains whitespace or control characters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Pipeline not found
           content:
@@ -397,6 +461,8 @@ paths:
       description: Returns the current state of the pipeline
       operationId: getPipelineState
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline state
           content:
@@ -440,6 +506,8 @@ paths:
             example:
               name: playing
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: State changed successfully
           content:
@@ -469,6 +537,8 @@ paths:
       description: Returns a list of elements in the pipeline
       operationId: listElements
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: List of elements
           content:
@@ -493,6 +563,8 @@ paths:
       description: Returns details about a specific element
       operationId: getElement
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Element details
           content:
@@ -517,6 +589,8 @@ paths:
       description: Returns all properties of an element
       operationId: listProperties
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: List of properties
           content:
@@ -542,6 +616,8 @@ paths:
       description: Returns the current value of an element property
       operationId: getProperty
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Property value
           content:
@@ -591,6 +667,8 @@ paths:
             example:
               name: "640"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Property updated successfully
           content:
@@ -626,6 +704,8 @@ paths:
       description: Reads the next message from the pipeline bus
       operationId: readBusMessage
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Bus message
           content:
@@ -649,6 +729,8 @@ paths:
       description: Returns the current bus read timeout in nanoseconds
       operationId: getBusTimeout
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Bus timeout value
           content:
@@ -676,6 +758,8 @@ paths:
             example:
               name: "1000000000"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Timeout updated
           content:
@@ -693,6 +777,8 @@ paths:
       description: Returns the current bus message type filter
       operationId: getBusFilter
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Bus filter value
           content:
@@ -718,6 +804,8 @@ paths:
                   type: string
                   description: Message type filter (e.g., "eos+error+warning")
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Filter updated
           content:
@@ -736,6 +824,8 @@ paths:
       description: Returns all signals available on an element
       operationId: listSignals
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: List of signals
           content:
@@ -773,6 +863,8 @@ paths:
                   type: string
                   description: Signal callback name
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Signal connected
           content:
@@ -798,6 +890,8 @@ paths:
                   type: string
                   description: Signal callback name
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Signal disconnected
           content:
@@ -852,6 +946,8 @@ paths:
                   name: seek
                   description: "1.0 0 none 0 none 5000000000"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Event sent successfully
           content:
@@ -875,6 +971,8 @@ paths:
       description: Returns the pipeline graph in GraphViz DOT format for visualization
       operationId: getPipelineGraph
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Pipeline graph in DOT format
           content:
@@ -898,6 +996,8 @@ paths:
       description: Returns whether verbose mode (deep notify) is enabled
       operationId: getVerbose
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Verbose mode status
           content:
@@ -927,6 +1027,8 @@ paths:
             example:
               name: "true"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Verbose mode updated
           content:
@@ -946,6 +1048,8 @@ paths:
       description: Returns the current signal callback timeout
       operationId: getSignalTimeout
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Signal timeout value
           content:
@@ -971,6 +1075,8 @@ paths:
                   type: string
                   description: Timeout value
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Timeout updated
           content:
@@ -1002,6 +1108,8 @@ paths:
             example:
               name: "true"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Debug setting updated
           content:
@@ -1043,6 +1151,8 @@ paths:
             example:
               name: "5"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Debug threshold updated
           content:
@@ -1072,6 +1182,8 @@ paths:
                     - "true"
                     - "false"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Debug color setting updated
           content:
@@ -1101,6 +1213,8 @@ paths:
                     - "true"
                     - "false"
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Debug thresholds reset
           content:
@@ -1109,6 +1223,34 @@ paths:
                 $ref: '#/components/schemas/SuccessResponse'
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Enforced only when the daemon was started with `--http-api-token`
+        or `GSTD_HTTP_API_TOKEN`. `GET /health` never requires it.
+
+  responses:
+    Unauthorized:
+      description: >-
+        API token authentication is configured and the request carried a
+        missing or invalid `Authorization: Bearer` token
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            enum:
+              - Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: 1
+            description: "Unauthorized: missing or invalid API token"
+            response: null
+
   parameters:
     PipelineName:
       name: pipeline_name
@@ -1204,19 +1346,6 @@ components:
                   type: string
                   enum:
                     - healthy
-
-    UnhealthyResponse:
-      allOf:
-        - $ref: '#/components/schemas/BaseResponse'
-        - type: object
-          properties:
-            response:
-              type: object
-              properties:
-                status:
-                  type: string
-                  enum:
-                    - unhealthy
 
     PipelineStatusResponse:
       allOf:
@@ -1494,6 +1623,7 @@ components:
         - 16: Event error (GSTD_EVENT_ERROR)
         - 17: Missing argument (GSTD_MISSING_ARGUMENT)
         - 18: Missing name (GSTD_MISSING_NAME)
+        - 19: Resource limit reached (GSTD_MAX_LIMIT_REACHED)
       enum:
         - 0
         - 1
@@ -1514,3 +1644,4 @@ components:
         - 16
         - 17
         - 18
+        - 19
