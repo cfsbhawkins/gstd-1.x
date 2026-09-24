@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   make the HTTP server refuse to start. The `cors-origin` property
   rejects them with a warning and keeps its current value. `Vary: Origin`
   is now always sent with the origin.
+- **Pipeline capacity reserved before the graph is built**
+  (`gstd_list.c`). `gstd_list_create` checked `max-children`, dropped the
+  lock, built the whole pipeline, and only enforced the cap again on
+  append. Parallel creates could therefore all pay the graph, memory,
+  and fd cost before being rejected. `GstdList` now reserves an
+  in-flight slot under the lock before construction. In-flight creates
+  count against the cap. A failed build or duplicate name releases the
+  slot, and success turns it into a child atomically. A concurrent-create
+  regression checks that at most `max-children` constructions ever run
+  at once.
 
 ### Fixed
 - **CI breakage** across the workflow matrix:

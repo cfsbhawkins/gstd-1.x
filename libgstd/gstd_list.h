@@ -63,6 +63,12 @@ struct _GstdList
   GParamFlags flags;
 
   GList *list;
+
+  /* Slots held by creates whose resource is still being constructed.
+   * count + reserved never exceeds max_children, so concurrent creates
+   * cannot all pay the construction cost before being rejected. Read and
+   * written under the object lock. */
+  guint reserved;
 };
 
 struct _GstdListClass

@@ -45,7 +45,9 @@ opt-in hardening on top of that:
   list is a startup error.
 - **Pipeline cap** — `--max-pipelines <count>` or `GSTD_MAX_PIPELINES`
   limits how many pipelines may exist at once (default: unlimited),
-  bounding memory/FD exhaustion from runaway clients.
+  bounding memory/FD exhaustion from runaway clients. Pipelines still
+  being built count against the cap, so a burst of parallel creates is
+  rejected before the surplus pipelines are constructed.
 - **HTTP resource names** (`?name=`) may not contain whitespace or
   control characters, so they can no longer smuggle extra arguments
   into the internal command parser.

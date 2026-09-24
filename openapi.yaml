@@ -49,6 +49,8 @@ info:
     must not contain whitespace or control characters; offending requests
     are rejected with `400`. A configured pipeline cap (`--max-pipelines`
     or `GSTD_MAX_PIPELINES`) rejects creates past the limit with `429`.
+    Pipelines still being built count against the cap, so a rejected
+    create never constructs its pipeline.
 
     For additional documentation, see the official RidgeRun wiki:
     https://developer.ridgerun.com/wiki/index.php/GStreamer_Daemon_-_HTTP_API
