@@ -38,9 +38,6 @@
 #include <gio/gio.h>
 #include <gst/check/gstcheck.h>
 
-/* Away from the daemon's default and from test_gstd_http's port */
-#define TEST_PORT_BASE 15100
-
 /* How long a clean exit may take before the test gives up on it */
 #define TEST_EXIT_LIMIT_MS 10000
 
@@ -48,6 +45,40 @@
  * uninterruptible g_usleep() in the chain function, so PAUSED->READY waits
  * for it before the streaming thread can be stopped. */
 #define STUCK_PIPELINE "videotestsrc ! identity sleep-time=60000000 ! fakesink"
+
+/* A port nobody is listening on right now, so concurrent runs of this
+ * suite on one host do not collide. The kernel picks it; the gap between
+ * closing it here and gstd binding it is the usual, small race. */
+static guint
+pick_port (void)
+{
+  GSocket *socket;
+  GInetAddress *loopback;
+  GSocketAddress *address;
+  GError *error = NULL;
+  guint port;
+
+  socket = g_socket_new (G_SOCKET_FAMILY_IPV4, G_SOCKET_TYPE_STREAM,
+      G_SOCKET_PROTOCOL_TCP, &error);
+  fail_unless (socket != NULL, "%s", error ? error->message : "");
+
+  loopback = g_inet_address_new_loopback (G_SOCKET_FAMILY_IPV4);
+  address = g_inet_socket_address_new (loopback, 0);
+  fail_unless (g_socket_bind (socket, address, TRUE, &error), "%s",
+      error ? error->message : "");
+  g_object_unref (address);
+  g_object_unref (loopback);
+
+  address = g_socket_get_local_address (socket, &error);
+  fail_unless (address != NULL, "%s", error ? error->message : "");
+  port = g_inet_socket_address_get_port (G_INET_SOCKET_ADDRESS (address));
+  g_object_unref (address);
+
+  g_socket_close (socket, NULL);
+  g_object_unref (socket);
+
+  return port;
+}
 
 static GPid
 spawn_gstd (guint port, const gchar * shutdown_timeout)
@@ -167,7 +198,7 @@ is_running (GPid pid)
  */
 GST_START_TEST (test_sigint_idle_exits_clean)
 {
-  const guint port = TEST_PORT_BASE;
+  const guint port = pick_port ();
   GPid pid = spawn_gstd (port, "5");
   GSocketConnection *conn = connect_gstd (port);
   gint status = 0;
@@ -192,7 +223,7 @@ GST_END_TEST;
  */
 GST_START_TEST (test_sigterm_playing_pipeline_exits_clean)
 {
-  const guint port = TEST_PORT_BASE + 1;
+  const guint port = pick_port ();
   GPid pid = spawn_gstd (port, "5");
   gint status = 0;
   gint64 elapsed_ms = 0;
@@ -219,7 +250,7 @@ GST_END_TEST;
  */
 GST_START_TEST (test_sigterm_with_idle_client_exits_clean)
 {
-  const guint port = TEST_PORT_BASE + 4;
+  const guint port = pick_port ();
   GPid pid = spawn_gstd (port, "5");
   GSocketConnection *conn = connect_gstd (port);
   gint status = 0;
@@ -249,7 +280,7 @@ GST_END_TEST;
  */
 GST_START_TEST (test_stuck_teardown_exits_at_deadline)
 {
-  const guint port = TEST_PORT_BASE + 2;
+  const guint port = pick_port ();
   GPid pid = spawn_gstd (port, "1");
   gint status = 0;
   gint64 elapsed_ms = 0;
@@ -272,7 +303,7 @@ GST_END_TEST;
  */
 GST_START_TEST (test_second_signal_forces_exit)
 {
-  const guint port = TEST_PORT_BASE + 3;
+  const guint port = pick_port ();
   GPid pid = spawn_gstd (port, "0");
   gint status = 0;
   gint64 elapsed_ms = 0;

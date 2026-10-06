@@ -57,7 +57,7 @@
  * the same state change. A second signal exits at once. */
 typedef struct
 {
-  GMainLoop *main_loop;
+  GMainLoop *main_loop;         /* owned; cleared under lock by finish */
   guint timeout;                /* seconds; 0 waits forever */
   gint fds[2];                  /* the handler writes, the thread reads */
 
@@ -187,17 +187,20 @@ gstd_shutdown_thread (gpointer user_data)
   GST_INFO ("Signal %d received, shutting down...", signum);
   g_print ("\n");
 
-  /* Through an idle source rather than g_main_loop_quit() directly: a quit
-   * that lands before g_main_loop_run() is discarded, and the signal may
-   * have arrived before the loop was entered. The idle waits for it. */
-  g_idle_add_full (G_PRIORITY_HIGH, gstd_shutdown_quit,
-      g_main_loop_ref (shutdown_state.main_loop),
-      (GDestroyNotify) g_main_loop_unref);
-
   g_mutex_lock (&shutdown_state.lock);
-  if (shutdown_state.timeout > 0 && !shutdown_state.done) {
-    shutdown_state.deadline =
-        g_thread_new ("gstd-deadline", gstd_shutdown_deadline_thread, NULL);
+  if (!shutdown_state.done) {
+    /* Through an idle source rather than g_main_loop_quit() directly: a
+     * quit that lands before g_main_loop_run() is discarded, and the signal
+     * may have arrived before the loop was entered. The idle waits for it.
+     * The loop is referenced under the lock, where finish releases it. */
+    g_idle_add_full (G_PRIORITY_HIGH, gstd_shutdown_quit,
+        g_main_loop_ref (shutdown_state.main_loop),
+        (GDestroyNotify) g_main_loop_unref);
+
+    if (shutdown_state.timeout > 0) {
+      shutdown_state.deadline =
+          g_thread_new ("gstd-deadline", gstd_shutdown_deadline_thread, NULL);
+    }
   }
   g_mutex_unlock (&shutdown_state.lock);
 
@@ -228,7 +231,6 @@ gstd_shutdown_start (GMainLoop * main_loop, guint timeout)
   GError *error = NULL;
   GThread *thread;
 
-  shutdown_state.main_loop = main_loop;
   shutdown_state.timeout = timeout;
 
   if (!g_unix_open_pipe (shutdown_state.fds, FD_CLOEXEC, &error)) {
@@ -237,11 +239,17 @@ gstd_shutdown_start (GMainLoop * main_loop, guint timeout)
     return FALSE;
   }
 
+  /* Our own reference: main() drops its own as soon as the loop returns,
+   * while the thread may still need the loop until finish. */
+  shutdown_state.main_loop = g_main_loop_ref (main_loop);
+
   thread = g_thread_try_new ("gstd-shutdown", gstd_shutdown_thread, NULL,
       &error);
   if (!thread) {
     g_printerr ("Unable to create the shutdown thread: %s\n", error->message);
     g_error_free (error);
+    g_main_loop_unref (shutdown_state.main_loop);
+    shutdown_state.main_loop = NULL;
     return FALSE;
   }
   /* Never joined: it blocks on the pipe until the process exits */
@@ -257,22 +265,29 @@ gstd_shutdown_start (GMainLoop * main_loop, guint timeout)
   return TRUE;
 }
 
-/* Marks the clean path finished and reaps the deadline thread, so it cannot
- * wake after main() has returned and fail a shutdown that completed. */
+/* Marks the clean path finished, releases the loop and reaps the deadline
+ * thread, so neither can be used after main() has returned or fail a
+ * shutdown that completed. */
 static void
 gstd_shutdown_finish (void)
 {
   GThread *deadline;
+  GMainLoop *main_loop;
 
   g_mutex_lock (&shutdown_state.lock);
   shutdown_state.done = TRUE;
   deadline = shutdown_state.deadline;
   shutdown_state.deadline = NULL;
+  main_loop = shutdown_state.main_loop;
+  shutdown_state.main_loop = NULL;
   g_cond_broadcast (&shutdown_state.cond);
   g_mutex_unlock (&shutdown_state.lock);
 
   if (deadline) {
     g_thread_join (deadline);
+  }
+  if (main_loop) {
+    g_main_loop_unref (main_loop);
   }
 }
 

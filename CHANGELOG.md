@@ -85,7 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connected client. The handler now shares a reference-counted context
   with the socket that records whether the session may still be used;
   stop refuses further handlers, cancels every pending read and waits for
-  the running handlers to finish before the session is released.
+  the running handlers to finish before the session is released. A handler
+  stuck inside a request (a wedged state change) is waited for as well;
+  only the daemon's shutdown deadline bounds that wait.
 - **Shutdown with a PLAYING pipeline never finished** (`gstd.c`).
   `main()` called `gst_deinit()` before `gstd_free()`, so GStreamer waited
   for its task pool threads while the pipelines that owned them were still
