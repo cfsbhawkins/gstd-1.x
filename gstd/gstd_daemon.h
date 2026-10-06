@@ -51,11 +51,14 @@ gboolean gstd_daemon_init (gint argc, gchar * argv[], gchar * pidfilename);
 gboolean gstd_daemon_start (gboolean * parent);
 
 /**
- * Closes the resources associated with the daemon, if any.
+ * Sends SIGTERM to the running daemon and waits for it to exit.
  *
- * \return TRUE if the daemon was successfully closed, FALSE
- * otherwise.
+ * \param timeout Seconds to wait for the daemon to exit. Should exceed
+ * the daemon's own --shutdown-timeout, after which it exits on its own.
+ *
+ * \return TRUE if the daemon exited, FALSE if none was running or it
+ * did not exit within the timeout (its pid file is then left in place).
  */
-gboolean gstd_daemon_stop (void);
+gboolean gstd_daemon_stop (guint timeout);
 
 #endif // __GSTD_DAEMON_H__

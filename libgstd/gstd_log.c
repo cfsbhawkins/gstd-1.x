@@ -48,6 +48,9 @@ gstd_log_proxy (GstDebugCategory * category, GstDebugLevel level,
 
      static FILE *_gstdlog = NULL;
      static FILE *_gstlog = NULL;
+
+/* Guards the streams between gstd_log_write_line() and gstd_log_deinit() */
+     static GMutex _lock;
      static gchar *gstd_filename = NULL;
      static gchar *gst_filename = NULL;
 
@@ -102,14 +105,43 @@ void
 gstd_log_deinit (void)
 {
   g_free (gstd_filename);
+  gstd_filename = NULL;
   g_free (gst_filename);
+  gst_filename = NULL;
 
   if (!_gstdlog) {
     return;
   }
 
+  /* Detach the proxy before closing its streams: logging holds the log
+   * function lock while it calls the proxy, so once the removal returns
+   * no thread is inside it any more. */
+  gst_debug_remove_log_function (gstd_log_proxy);
+
+  g_mutex_lock (&_lock);
   fclose (_gstdlog);
+  _gstdlog = NULL;
   fclose (_gstlog);
+  _gstlog = NULL;
+  g_mutex_unlock (&_lock);
+}
+
+gboolean
+gstd_log_write_line (GstDebugLevel level, const gchar * message)
+{
+  gboolean written = FALSE;
+
+  g_mutex_lock (&_lock);
+  if (_gstdlog) {
+    fprintf (_gstdlog, "%" GST_TIME_FORMAT " %s gstd: %s\n",
+        GST_TIME_ARGS (gst_util_get_timestamp ()),
+        gst_debug_level_get_name (level), message);
+    fflush (_gstdlog);
+    written = TRUE;
+  }
+  g_mutex_unlock (&_lock);
+
+  return written;
 }
 
 static void

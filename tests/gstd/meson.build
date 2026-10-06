@@ -10,11 +10,13 @@ gstd_tests = [
   ['test_gstd_childproxy_property.c'],
   ['test_gstd_pipeline_limit.c'],
   ['test_gstd_http.c'],
+  ['test_gstd_shutdown.c'],
 ]
 
 # Add C Definitions for tests
 test_defines = [
   '-DTESTFILE="' + meson.current_source_dir() + '/meson.build"',
+  '-DGSTD_BINARY="' + gstd_exe.full_path() + '"',
 ]
 
 plugins_dir = []
@@ -52,6 +54,7 @@ foreach t : gstd_tests
     env.set('GST_REGISTRY', '@0@/@1@.registry'.format(meson.current_build_dir(), test_name))
 
     # Run tests
-    test(test_name, exe, env: env, timeout : 60)
+    # test_gstd_shutdown spawns the daemon, so a targeted run builds it
+    test(test_name, exe, env: env, timeout : 60, depends : gstd_exe)
   endif
 endforeach

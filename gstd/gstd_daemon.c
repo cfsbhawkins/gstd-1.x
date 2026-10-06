@@ -203,24 +203,30 @@ out:
 }
 
 gboolean
-gstd_daemon_stop (void)
+gstd_daemon_stop (guint timeout)
 {
-  gboolean ret = FALSE;
-  guint timeout = 5;
+  gint wait_errno;
 
-  ret = daemon_pid_file_kill_wait (SIGTERM, timeout);
-  if (ret < 0) {
-    GST_ERROR
-        ("No running Gstd found or gstd.pid was saved using \"--pid-path\"");
-    ret = FALSE;
-  } else {
-    ret = TRUE;
+  if (daemon_pid_file_kill_wait (SIGTERM, (gint) MIN (timeout, G_MAXINT)) == 0) {
+    daemon_pid_file_remove ();
+    return TRUE;
+  }
+  wait_errno = errno;
+
+  if (wait_errno == ETIME) {
+    /* Still running: the pid file is its, not ours to remove */
+    g_printerr ("Gstd did not exit within %u s\n", timeout);
+    GST_ERROR ("Gstd did not exit within %u s", timeout);
+    return FALSE;
   }
 
-  /* Cleanup the PID file */
+  GST_ERROR
+      ("No running Gstd found or gstd.pid was saved using \"--pid-path\"");
+
+  /* Cleanup the stale PID file */
   daemon_pid_file_remove ();
 
-  return ret;
+  return FALSE;
 }
 
 static const gchar *

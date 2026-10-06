@@ -12,7 +12,7 @@ libgstd_src_files = [
 
 # Create gstd application
 exe_name = '@0@-@1@'.format(gstd_name, apiversion)
-executable(exe_name,
+gstd_exe = executable(exe_name,
   [gstd_src_files, libgstd_src_files],
   install: true,
   include_directories : [configinc, libgstd_inc_dir],

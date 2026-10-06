@@ -55,3 +55,16 @@ opt-in hardening on top of that:
   install as mode 1777 (sticky, like `/tmp`) instead of 777, so local
   users cannot delete or replace each other's pid/socket/log files.
   Deployments with a dedicated gstd user should tighten this to 0750.
+
+## Shutdown (this fork)
+
+`SIGINT`/`SIGTERM` are received by a dedicated thread rather than a
+main-loop signal source, so a daemon whose main loop is blocked behind a
+pipeline that never finishes a state change still shuts down. The same
+thread bounds the shutdown: `--shutdown-timeout <seconds>` (default 5)
+is how long gstd waits for pipelines and request handlers to wind down
+before it exits anyway, with exit status 1 and a log line. `0` waits
+forever, which is the previous behaviour; a second signal exits at once
+in either case. `gstd -k` waits for the daemon's deadline plus 2 s, so
+pass the same `--shutdown-timeout` to `-k` that the daemon was started
+with when it is not the default.

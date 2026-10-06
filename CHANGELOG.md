@@ -58,6 +58,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at once.
 
 ### Fixed
+- **Shutdown no longer depends on the main loop, and is bounded**
+  (`gstd.c`). `SIGINT`/`SIGTERM` were GLib signal sources dispatched by the
+  main loop. A pipeline whose state change never returns (a deadlocked
+  element, a source blocked behind a stalled downstream) holds a lock that
+  the main thread's own request paths then wait on, so the main loop never
+  dispatched the signal and the daemon ignored `SIGTERM` until it was
+  killed. Even when the loop did quit, stopping the HTTP server waits for
+  every request handler, including one stuck in that state change. The
+  signal handler now writes to a pipe that a dedicated thread reads (the
+  process signal mask is untouched, so threads and child processes such as
+  the plugin scanner are unaffected). The first signal quits the main loop
+  and, after `--shutdown-timeout` seconds (default 5; `0` waits forever),
+  exits with status 1 and a log line if the clean path has not finished; a
+  second signal exits at once. A signal that arrives before the main loop
+  is entered is honoured rather than lost, and a shutdown that completes
+  near the deadline is never reported as a failure. `gstd -k` waits for the
+  daemon's deadline plus 2 s (it honours `--shutdown-timeout` too) and, if
+  the daemon is still running after that, says so, leaves its pid file
+  alone instead of removing it from under the live process, and exits with
+  status 1 (as it now also does when no daemon was running). Diagnostics
+  from the shutdown threads never block: a stalled stdout or stderr
+  consumer cannot hold up the deadline or the second signal.
+- **Log files were closed before the session was released** (`gstd.c`,
+  `gstd_log.c`). In daemon mode the session's own teardown traces went
+  through the still-registered log proxy to a closed stream. The log is
+  now closed after the session is released, and closing it detaches the
+  proxy first.
+- **TCP/Unix socket handlers could outlive the session** (`gstd_socket.c`).
+  The service's `run` handler took the session as plain user data and was
+  dispatched on a pool thread, so a connection accepted just before
+  shutdown could run its handler after the session had been freed and
+  crash. Stopping the socket also never unblocked handlers waiting on a
+  connected client. The handler now shares a reference-counted context
+  with the socket that records whether the session may still be used;
+  stop refuses further handlers, cancels every pending read and waits for
+  the running handlers to finish before the session is released. A handler
+  stuck inside a request (a wedged state change) is waited for as well;
+  only the daemon's shutdown deadline bounds that wait.
+- **Shutdown with a PLAYING pipeline never finished** (`gstd.c`).
+  `main()` called `gst_deinit()` before `gstd_free()`, so GStreamer waited
+  for its task pool threads while the pipelines that owned them were still
+  running; the session, and every pipeline, is now released first. With a
+  playing `videotestsrc ! fakesink` pipeline, `SIGTERM` used to hang until
+  the process was killed; it now exits in well under a second.
 - **CI breakage** across the workflow matrix:
   - `gstd_action.c` / `gstd_http.c` mixed declarations failed
     `meson --werror` (`-Wdeclaration-after-statement`); an unused variable

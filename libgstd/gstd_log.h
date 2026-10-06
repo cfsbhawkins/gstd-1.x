@@ -25,6 +25,19 @@
 
 gboolean gstd_log_init (const gchar * gstdfilename, const gchar * gstfilename);
 void gstd_log_deinit (void);
+
+/**
+ * Appends one line to the gstd log file, bypassing the GStreamer log
+ * machinery. For traces that must not depend on it, such as those of the
+ * shutdown threads.
+ *
+ * \param level The level to label the line with
+ * \param message The line
+ *
+ * \return TRUE if the line was written, FALSE if the log does not go to
+ * a file (foreground mode, or after gstd_log_deinit()).
+ */
+gboolean gstd_log_write_line (GstDebugLevel level, const gchar * message);
 void gstd_debug_init (void);
 
 gchar *gstd_log_get_current_gstd (void);
