@@ -30,16 +30,22 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <gio/gio.h>
+#include <glib-unix.h>
 #include <gst/check/gstcheck.h>
 
 /* How long a clean exit may take before the test gives up on it */
 #define TEST_EXIT_LIMIT_MS 10000
+
+/* A 1 s deadline, less the rounding of the daemon's own clock reads */
+#define DEADLINE_LOWER_MS 950
 
 /* A pipeline whose teardown blocks: identity's sleep-time is an
  * uninterruptible g_usleep() in the chain function, so PAUSED->READY waits
@@ -80,8 +86,9 @@ pick_port (void)
   return port;
 }
 
+/* output_fd becomes the daemon's stdout and stderr; -1 inherits ours */
 static GPid
-spawn_gstd (guint port, const gchar * shutdown_timeout)
+spawn_gstd (guint port, const gchar * shutdown_timeout, gint output_fd)
 {
   gchar port_str[16];
   gchar *argv[] = { (gchar *) GSTD_BINARY, (gchar *) "-q", (gchar *) "-p",
@@ -91,11 +98,36 @@ spawn_gstd (guint port, const gchar * shutdown_timeout)
   GError *error = NULL;
 
   g_snprintf (port_str, sizeof (port_str), "%u", port);
-  fail_unless (g_spawn_async (NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
-          NULL, NULL, &pid, &error), "spawning %s: %s", GSTD_BINARY,
+  fail_unless (g_spawn_async_with_fds (NULL, argv, NULL,
+          G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, -1, output_fd,
+          output_fd, &error), "spawning %s: %s", GSTD_BINARY,
       error ? error->message : "unknown error");
 
   return pid;
+}
+
+/* The write end of a pipe nobody reads, already full, so that the next
+ * blocking write to it never returns. Handed to a daemon as its stdout
+ * and stderr it stands in for a stalled log consumer. */
+static gint
+full_pipe (void)
+{
+  gint fds[2];
+  gchar junk[4096] = { 0 };
+  gint flags;
+
+  fail_unless (g_unix_open_pipe (fds, FD_CLOEXEC, NULL));
+
+  flags = fcntl (fds[1], F_GETFL);
+  fcntl (fds[1], F_SETFL, flags | O_NONBLOCK);
+  while (write (fds[1], junk, sizeof (junk)) > 0) {
+  }
+  fail_unless (errno == EAGAIN, "filling the pipe: %s", g_strerror (errno));
+  /* The daemon shares this file description, so it must block again */
+  fcntl (fds[1], F_SETFL, flags);
+
+  /* The read end stays open, unread, for the life of the test process */
+  return fds[1];
 }
 
 static GSocketConnection *
@@ -159,14 +191,18 @@ play_pipeline (guint port, const gchar * description)
   g_usleep (300 * 1000);
 }
 
-/* Waits up to limit_ms for the process to exit. Returns FALSE if it is
- * still running, in which case it is killed so the test leaves nothing
- * behind. */
+/* Sends the signal and waits up to limit_ms for the process to exit.
+ * elapsed_ms is measured from just before the signal, so descheduling of
+ * the test cannot take time off it. Returns FALSE if the process is still
+ * running, in which case it is killed so the test leaves nothing behind. */
 static gboolean
-wait_exit (GPid pid, guint limit_ms, gint * status, gint64 * elapsed_ms)
+signal_and_wait_exit (GPid pid, gint signum, guint limit_ms, gint * status,
+    gint64 * elapsed_ms)
 {
   const gint64 start = g_get_monotonic_time ();
   pid_t reaped;
+
+  fail_unless (kill (pid, signum) == 0, "kill: %s", g_strerror (errno));
 
   for (;;) {
     reaped = waitpid (pid, status, WNOHANG);
@@ -199,7 +235,7 @@ is_running (GPid pid)
 GST_START_TEST (test_sigint_idle_exits_clean)
 {
   const guint port = pick_port ();
-  GPid pid = spawn_gstd (port, "5");
+  GPid pid = spawn_gstd (port, "5", -1);
   GSocketConnection *conn = connect_gstd (port);
   gint status = 0;
   gint64 elapsed_ms = 0;
@@ -207,9 +243,8 @@ GST_START_TEST (test_sigint_idle_exits_clean)
   g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
   g_object_unref (conn);
 
-  fail_unless (kill (pid, SIGINT) == 0);
-  fail_unless (wait_exit (pid, TEST_EXIT_LIMIT_MS, &status, &elapsed_ms),
-      "gstd did not exit on SIGINT");
+  fail_unless (signal_and_wait_exit (pid, SIGINT, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms), "gstd did not exit on SIGINT");
   fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 0,
       "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
 }
@@ -224,14 +259,14 @@ GST_END_TEST;
 GST_START_TEST (test_sigterm_playing_pipeline_exits_clean)
 {
   const guint port = pick_port ();
-  GPid pid = spawn_gstd (port, "5");
+  GPid pid = spawn_gstd (port, "5", -1);
   gint status = 0;
   gint64 elapsed_ms = 0;
 
   play_pipeline (port, "videotestsrc ! fakesink");
 
-  fail_unless (kill (pid, SIGTERM) == 0);
-  fail_unless (wait_exit (pid, TEST_EXIT_LIMIT_MS, &status, &elapsed_ms),
+  fail_unless (signal_and_wait_exit (pid, SIGTERM, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms),
       "gstd did not exit on SIGTERM with a playing pipeline");
   fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 0,
       "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
@@ -251,7 +286,7 @@ GST_END_TEST;
 GST_START_TEST (test_sigterm_with_idle_client_exits_clean)
 {
   const guint port = pick_port ();
-  GPid pid = spawn_gstd (port, "5");
+  GPid pid = spawn_gstd (port, "5", -1);
   GSocketConnection *conn = connect_gstd (port);
   gint status = 0;
   gint64 elapsed_ms = 0;
@@ -259,8 +294,8 @@ GST_START_TEST (test_sigterm_with_idle_client_exits_clean)
   /* The handler for conn is now, or is about to be, blocked reading it */
   g_usleep (200 * 1000);
 
-  fail_unless (kill (pid, SIGTERM) == 0);
-  fail_unless (wait_exit (pid, TEST_EXIT_LIMIT_MS, &status, &elapsed_ms),
+  fail_unless (signal_and_wait_exit (pid, SIGTERM, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms),
       "gstd did not exit on SIGTERM with a client connected");
   fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 0,
       "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
@@ -281,18 +316,41 @@ GST_END_TEST;
 GST_START_TEST (test_stuck_teardown_exits_at_deadline)
 {
   const guint port = pick_port ();
-  GPid pid = spawn_gstd (port, "1");
+  GPid pid = spawn_gstd (port, "1", -1);
   gint status = 0;
   gint64 elapsed_ms = 0;
 
   play_pipeline (port, STUCK_PIPELINE);
 
-  fail_unless (kill (pid, SIGTERM) == 0);
-  fail_unless (wait_exit (pid, TEST_EXIT_LIMIT_MS, &status, &elapsed_ms),
-      "gstd did not exit at the shutdown deadline");
+  fail_unless (signal_and_wait_exit (pid, SIGTERM, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms), "gstd did not exit at the shutdown deadline");
   fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 1,
       "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
-  fail_unless (elapsed_ms >= 1000 && elapsed_ms < 5000,
+  fail_unless (elapsed_ms >= DEADLINE_LOWER_MS && elapsed_ms < 5000,
+      "exit after %" G_GINT64_FORMAT " ms for a 1 s deadline", elapsed_ms);
+}
+
+GST_END_TEST;
+
+/*
+ * The same, with stdout and stderr on a pipe nobody drains: the deadline
+ * must not depend on a diagnostic that cannot be written.
+ */
+GST_START_TEST (test_stuck_teardown_exits_at_deadline_with_stalled_output)
+{
+  const guint port = pick_port ();
+  GPid pid = spawn_gstd (port, "1", full_pipe ());
+  gint status = 0;
+  gint64 elapsed_ms = 0;
+
+  play_pipeline (port, STUCK_PIPELINE);
+
+  fail_unless (signal_and_wait_exit (pid, SIGTERM, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms),
+      "gstd did not exit at the shutdown deadline with stalled output");
+  fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 1,
+      "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
+  fail_unless (elapsed_ms >= DEADLINE_LOWER_MS && elapsed_ms < 5000,
       "exit after %" G_GINT64_FORMAT " ms for a 1 s deadline", elapsed_ms);
 }
 
@@ -304,7 +362,7 @@ GST_END_TEST;
 GST_START_TEST (test_second_signal_forces_exit)
 {
   const guint port = pick_port ();
-  GPid pid = spawn_gstd (port, "0");
+  GPid pid = spawn_gstd (port, "0", -1);
   gint status = 0;
   gint64 elapsed_ms = 0;
 
@@ -315,9 +373,8 @@ GST_START_TEST (test_second_signal_forces_exit)
   fail_unless (is_running (pid),
       "gstd exited on its own with the teardown stuck and no deadline");
 
-  fail_unless (kill (pid, SIGTERM) == 0);
-  fail_unless (wait_exit (pid, TEST_EXIT_LIMIT_MS, &status, &elapsed_ms),
-      "gstd did not exit on the second SIGTERM");
+  fail_unless (signal_and_wait_exit (pid, SIGTERM, TEST_EXIT_LIMIT_MS,
+          &status, &elapsed_ms), "gstd did not exit on the second SIGTERM");
   fail_unless (WIFEXITED (status) && WEXITSTATUS (status) == 1,
       "status 0x%x after %" G_GINT64_FORMAT " ms", status, elapsed_ms);
   fail_unless (elapsed_ms < 2000,
@@ -340,6 +397,7 @@ gstd_shutdown_suite (void)
   tcase_add_test (tc, test_sigterm_playing_pipeline_exits_clean);
   tcase_add_test (tc, test_sigterm_with_idle_client_exits_clean);
   tcase_add_test (tc, test_stuck_teardown_exits_at_deadline);
+  tcase_add_test (tc, test_stuck_teardown_exits_at_deadline_with_stalled_output);
   tcase_add_test (tc, test_second_signal_forces_exit);
 
   return suite;

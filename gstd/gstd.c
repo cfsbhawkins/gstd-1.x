@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +76,9 @@ typedef struct
 /* With --shutdown-timeout 0 the daemon waits forever; -k cannot, so a day */
 #define GSTD_KILL_WAIT_FOREVER (24 * 60 * 60)
 
+/* How long a shutdown thread waits for stdout/stderr to accept a line */
+#define GSTD_SHUTDOWN_SAY_TIMEOUT_MS 100
+
 static GstdShutdown shutdown_state = { NULL, 0, {-1, -1}, };
 
 static void print_header ();
@@ -116,6 +120,44 @@ gstd_shutdown_wait_signal (gint * signum)
   return TRUE;
 }
 
+/* Diagnostics from the shutdown threads must never block: a stalled
+ * stdout or stderr consumer would otherwise defeat the deadline and the
+ * second signal. A stream is written only if it can take the line right
+ * now (a line shorter than PIPE_BUF then goes through whole). In daemon
+ * mode the line goes straight to the gstd log file, where no consumer can
+ * stall it, without passing through the GStreamer log machinery that the
+ * main thread is tearing down at the same time. */
+static void
+gstd_shutdown_say (gint fd, const gchar * line)
+{
+  struct pollfd pfd = { fd, POLLOUT, 0 };
+  G_GNUC_UNUSED gssize written;
+
+  if (poll (&pfd, 1, GSTD_SHUTDOWN_SAY_TIMEOUT_MS) > 0
+      && (pfd.revents & POLLOUT)) {
+    written = write (fd, line, strlen (line));
+  }
+}
+
+static void
+gstd_shutdown_log (GstDebugLevel level, const gchar * message)
+{
+  gchar *line;
+
+  if (gstd_log_write_line (level, message)) {
+    return;
+  }
+
+  /* Foreground: only what was visible before, at the default threshold */
+  if (level > GST_LEVEL_WARNING) {
+    return;
+  }
+
+  line = g_strconcat (message, "\n", NULL);
+  gstd_shutdown_say (STDERR_FILENO, line);
+  g_free (line);
+}
+
 static gboolean
 gstd_shutdown_quit (gpointer user_data)
 {
@@ -126,10 +168,12 @@ gstd_shutdown_quit (gpointer user_data)
 static void
 gstd_shutdown_exit_now (const gchar * reason)
 {
+  gchar *message = g_strdup_printf ("%s, exiting now", reason);
+
   /* Nothing below us can be waited for any longer, so leave without
-   * running the remaining cleanup. The log line is the only trace. */
-  g_printerr ("%s, exiting now\n", reason);
-  GST_ERROR ("%s, exiting now", reason);
+   * running the remaining cleanup. The log line is the only trace, and
+   * it must not be allowed to hold the exit up either. */
+  gstd_shutdown_log (GST_LEVEL_ERROR, message);
   _exit (EXIT_FAILURE);
 }
 
@@ -138,14 +182,13 @@ gstd_shutdown_exit_now (const gchar * reason)
 static void
 gstd_shutdown_restore_default (const gchar * why)
 {
-  const gchar *reason = g_strerror (errno);
+  gchar *message = g_strdup_printf ("%s: %s. SIGINT/SIGTERM will now "
+      "terminate gstd without cleanup", why, g_strerror (errno));
 
-  g_printerr ("%s: %s. SIGINT/SIGTERM will now terminate gstd without "
-      "cleanup\n", why, reason);
-  GST_ERROR ("%s: %s. SIGINT/SIGTERM will now terminate gstd without "
-      "cleanup", why, reason);
   signal (SIGINT, SIG_DFL);
   signal (SIGTERM, SIG_DFL);
+  gstd_shutdown_log (GST_LEVEL_ERROR, message);
+  g_free (message);
 }
 
 static gpointer
@@ -178,15 +221,14 @@ gstd_shutdown_thread (gpointer user_data)
 {
   gint signum = 0;
   gboolean done;
+  gchar *message;
 
   if (!gstd_shutdown_wait_signal (&signum)) {
     gstd_shutdown_restore_default ("Unable to wait for shutdown signals");
     return NULL;
   }
 
-  GST_INFO ("Signal %d received, shutting down...", signum);
-  g_print ("\n");
-
+  /* Arm everything first; the diagnostics below must not delay it */
   g_mutex_lock (&shutdown_state.lock);
   if (!shutdown_state.done) {
     /* Through an idle source rather than g_main_loop_quit() directly: a
@@ -203,6 +245,12 @@ gstd_shutdown_thread (gpointer user_data)
     }
   }
   g_mutex_unlock (&shutdown_state.lock);
+
+  /* Past the "^C" the terminal echoed, then the trace */
+  gstd_shutdown_say (STDOUT_FILENO, "\n");
+  message = g_strdup_printf ("Signal %d received, shutting down...", signum);
+  gstd_shutdown_log (GST_LEVEL_INFO, message);
+  g_free (message);
 
   /* A second signal ends the wait, however long the timeout. Once the
    * clean path has finished the process is already exiting, and the signal
@@ -419,6 +467,10 @@ main (gint argc, gchar * argv[])
     }
     if (gstd_daemon_stop (kill_wait)) {
       GST_INFO ("Gstd successfully stopped");
+    } else {
+      /* Not running, or still running past the wait: either way the
+       * caller's stop did not happen. */
+      ret = EXIT_FAILURE;
     }
     goto out;
   }
@@ -481,8 +533,6 @@ main (gint argc, gchar * argv[])
   /* Stop any IPC array */
   gstd_stop (gstd);
 
-  gstd_log_deinit ();
-
   goto out;
 
 error:
@@ -500,6 +550,9 @@ out:
      * GStreamer: gst_deinit() waits for the task pool's threads, and a
      * pipeline that is still PLAYING never returns its streaming threads. */
     gstd_free (gstd);
+    /* The session's own teardown traces are the last ones the log files
+     * see; gst_deinit() reports to stderr instead of a closed stream. */
+    gstd_log_deinit ();
     gst_deinit ();
     gstd_shutdown_finish ();
     return ret;

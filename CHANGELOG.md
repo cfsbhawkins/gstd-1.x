@@ -75,8 +75,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is entered is honoured rather than lost, and a shutdown that completes
   near the deadline is never reported as a failure. `gstd -k` waits for the
   daemon's deadline plus 2 s (it honours `--shutdown-timeout` too) and, if
-  the daemon is still running after that, says so and leaves its pid file
-  alone instead of removing it from under the live process.
+  the daemon is still running after that, says so, leaves its pid file
+  alone instead of removing it from under the live process, and exits with
+  status 1 (as it now also does when no daemon was running). Diagnostics
+  from the shutdown threads never block: a stalled stdout or stderr
+  consumer cannot hold up the deadline or the second signal.
+- **Log files were closed before the session was released** (`gstd.c`,
+  `gstd_log.c`). In daemon mode the session's own teardown traces went
+  through the still-registered log proxy to a closed stream. The log is
+  now closed after the session is released, and closing it detaches the
+  proxy first.
 - **TCP/Unix socket handlers could outlive the session** (`gstd_socket.c`).
   The service's `run` handler took the session as plain user data and was
   dispatched on a pool thread, so a connection accepted just before

@@ -54,6 +54,7 @@ foreach t : gstd_tests
     env.set('GST_REGISTRY', '@0@/@1@.registry'.format(meson.current_build_dir(), test_name))
 
     # Run tests
-    test(test_name, exe, env: env, timeout : 60)
+    # test_gstd_shutdown spawns the daemon, so a targeted run builds it
+    test(test_name, exe, env: env, timeout : 60, depends : gstd_exe)
   endif
 endforeach
