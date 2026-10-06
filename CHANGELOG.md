@@ -58,6 +58,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at once.
 
 ### Fixed
+- **Shutdown no longer depends on the main loop, and is bounded**
+  (`gstd.c`). `SIGINT`/`SIGTERM` were GLib signal sources dispatched by the
+  main loop. A pipeline whose state change never returns (a deadlocked
+  element, a source blocked behind a stalled downstream) holds a lock that
+  the main thread's own request paths then wait on, so the main loop never
+  dispatched the signal and the daemon ignored `SIGTERM` until it was
+  killed. Even when the loop did quit, stopping the HTTP server waits for
+  every request handler, including one stuck in that state change. The
+  signals are now blocked in every thread and received with `sigwait()` by
+  a dedicated thread that quits the main loop and, after
+  `--shutdown-timeout` seconds (default 5; `0` waits forever), exits with
+  status 1 and a log line if the clean path has not finished.
+- **Shutdown with a PLAYING pipeline never finished** (`gstd.c`).
+  `main()` called `gst_deinit()` before `gstd_free()`, so GStreamer waited
+  for its task pool threads while the pipelines that owned them were still
+  running; the session, and every pipeline, is now released first. With a
+  playing `videotestsrc ! fakesink` pipeline, `SIGTERM` used to hang until
+  the process was killed; it now exits in well under a second.
 - **CI breakage** across the workflow matrix:
   - `gstd_action.c` / `gstd_http.c` mixed declarations failed
     `meson --werror` (`-Wdeclaration-after-statement`); an unused variable
