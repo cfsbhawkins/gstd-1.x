@@ -36,6 +36,105 @@ GST_DEBUG_CATEGORY_STATIC (gstd_socket_debug);
 
 G_DEFINE_TYPE (GstdSocket, gstd_socket, GSTD_TYPE_IPC);
 
+/* Shared between the socket and the "run" handler of its service. The
+ * handler runs on the service's pool threads and may be dispatched after
+ * gstd_socket_stop() has returned, and after the session is gone, so
+ * neither may be its plain user data. This context outlives every
+ * dispatch instead (the closure keeps a reference until the service is
+ * finalized, which happens after its last job) and records whether the
+ * session may still be used. It also lets stop unblock the handlers that
+ * are waiting on a client and wait for all of them to finish. */
+struct _GstdSocketRun
+{
+  gint refcount;
+  GMutex lock;
+  GCond cond;
+  gboolean stopping;            /* no further handler may use the session */
+  guint in_flight;              /* handlers currently using the session */
+  GstdSession *session;         /* borrowed; valid until stopping */
+  GCancellable *cancellable;    /* cancels the reads of every connection */
+};
+
+static GstdSocketRun *
+gstd_socket_run_new (GstdSession * session)
+{
+  GstdSocketRun *run = g_new0 (GstdSocketRun, 1);
+
+  run->refcount = 1;
+  g_mutex_init (&run->lock);
+  g_cond_init (&run->cond);
+  run->session = session;
+  run->cancellable = g_cancellable_new ();
+
+  return run;
+}
+
+static GstdSocketRun *
+gstd_socket_run_ref (GstdSocketRun * run)
+{
+  g_atomic_int_inc (&run->refcount);
+  return run;
+}
+
+static void
+gstd_socket_run_unref (GstdSocketRun * run)
+{
+  if (!g_atomic_int_dec_and_test (&run->refcount)) {
+    return;
+  }
+
+  g_object_unref (run->cancellable);
+  g_cond_clear (&run->cond);
+  g_mutex_clear (&run->lock);
+  g_free (run);
+}
+
+static void
+gstd_socket_run_closure_notify (gpointer data, GClosure * closure)
+{
+  gstd_socket_run_unref ((GstdSocketRun *) data);
+}
+
+/* Claims the session for a handler. FALSE once the socket is stopping. */
+static gboolean
+gstd_socket_run_enter (GstdSocketRun * run)
+{
+  gboolean entered;
+
+  g_mutex_lock (&run->lock);
+  entered = !run->stopping;
+  if (entered) {
+    run->in_flight++;
+  }
+  g_mutex_unlock (&run->lock);
+
+  return entered;
+}
+
+static void
+gstd_socket_run_leave (GstdSocketRun * run)
+{
+  g_mutex_lock (&run->lock);
+  run->in_flight--;
+  g_cond_broadcast (&run->cond);
+  g_mutex_unlock (&run->lock);
+}
+
+/* Refuses further handlers, unblocks those waiting on a client and waits
+ * for every one of them to finish. A handler stuck inside a request is
+ * waited for too; the daemon's shutdown deadline bounds that. */
+static void
+gstd_socket_run_stop (GstdSocketRun * run)
+{
+  g_mutex_lock (&run->lock);
+  run->stopping = TRUE;
+  g_cancellable_cancel (run->cancellable);
+  while (run->in_flight > 0) {
+    g_cond_wait (&run->cond, &run->lock);
+  }
+  g_mutex_unlock (&run->lock);
+}
+
 /* VTable */
 
 static gboolean
@@ -68,6 +167,7 @@ gstd_socket_init (GstdSocket * self)
   GstdIpc *base = GSTD_IPC (self);
   GST_INFO_OBJECT (self, "Initializing gstd Socket");
   self->service = NULL;
+  self->run = NULL;
   base->enabled = FALSE;
 }
 
@@ -85,6 +185,7 @@ static gboolean
 gstd_socket_callback (GSocketService * service,
     GSocketConnection * connection, GObject * source_object, gpointer user_data)
 {
+  GstdSocketRun *run = (GstdSocketRun *) user_data;
   GstdSession *session;
   GInputStream *istream;
   GOutputStream *ostream;
@@ -102,10 +203,13 @@ gstd_socket_callback (GSocketService * service,
 
   g_return_val_if_fail (service, FALSE);
   g_return_val_if_fail (connection, FALSE);
-  g_return_val_if_fail (user_data, FALSE);
+  g_return_val_if_fail (run, FALSE);
 
-  session = GSTD_SESSION (user_data);
-  g_return_val_if_fail (session, FALSE);
+  if (!gstd_socket_run_enter (run)) {
+    /* Stopping. FALSE has the service close the connection. */
+    return FALSE;
+  }
+  session = run->session;
 
   /* Log client connection */
   remote_addr = g_socket_connection_get_remote_address (connection, NULL);
@@ -134,13 +238,19 @@ gstd_socket_callback (GSocketService * service,
   message = g_malloc (size + 1);
 
   while (TRUE) {
-    read = g_input_stream_read (istream, message, size, NULL, &error);
+    read = g_input_stream_read (istream, message, size, run->cancellable,
+        &error);
 
     /* Was connection closed or error? */
     if (read <= 0) {
       if (read < 0 && error) {
-        GST_WARNING_OBJECT (session, "Read error from %s: %s",
-            client_info, error->message);
+        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+          GST_DEBUG_OBJECT (session, "Closing connection to %s: stopping",
+              client_info);
+        } else {
+          GST_WARNING_OBJECT (session, "Read error from %s: %s",
+              client_info, error->message);
+        }
         g_error_free (error);
         error = NULL;
       } else if (read == 0) {
@@ -182,15 +292,20 @@ gstd_socket_callback (GSocketService * service,
     output = NULL;
 
     read =
-        g_output_stream_write (ostream, response, strlen (response) + 1, NULL,
-        &error);
+        g_output_stream_write (ostream, response, strlen (response) + 1,
+        run->cancellable, &error);
     g_free (response);
     response = NULL;
 
     if (read < 0) {
       if (error) {
-        GST_WARNING_OBJECT (session, "Write error to %s: %s",
-            client_info, error->message);
+        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+          GST_DEBUG_OBJECT (session, "Closing connection to %s: stopping",
+              client_info);
+        } else {
+          GST_WARNING_OBJECT (session, "Write error to %s: %s",
+              client_info, error->message);
+        }
         g_error_free (error);
         error = NULL;
       }
@@ -212,6 +327,8 @@ gstd_socket_callback (GSocketService * service,
   GST_DEBUG_OBJECT (session, "Client disconnected: %s (processed %u commands)",
       client_info, command_count);
   g_free (client_info);
+
+  gstd_socket_run_leave (run);
 
   return TRUE;
 }
@@ -235,8 +352,10 @@ gstd_socket_start (GstdIpc * base, GstdSession * session)
   if (ret != GSTD_EOK)
     return ret;
 
-  /* listen to the 'incoming' signal */
-  g_signal_connect (service, "run", G_CALLBACK (gstd_socket_callback), session);
+  /* The handler shares the run context; its closure owns one reference */
+  self->run = gstd_socket_run_new (session);
+  g_signal_connect_data (service, "run", G_CALLBACK (gstd_socket_callback),
+      gstd_socket_run_ref (self->run), gstd_socket_run_closure_notify, 0);
 
   /* start the socket service */
   g_socket_service_start (service);
@@ -266,8 +385,12 @@ gstd_socket_stop (GstdIpc * base)
     GST_INFO_OBJECT (session, "Closing SOCKET connection for %s",
         GSTD_OBJECT_NAME (session));
     g_socket_listener_close (listener);
+    gstd_socket_run_stop (self->run);
     g_socket_service_stop (service);
     g_object_unref (service);
+
+    gstd_socket_run_unref (self->run);
+    self->run = NULL;
   }
   return GSTD_EOK;
 }

@@ -22,10 +22,14 @@
 #include "config.h"
 #endif
 
-#include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+
+#include <glib-unix.h>
 
 #include "gstd.h"
 #include "gstd_daemon.h"
@@ -35,21 +39,43 @@
       "\nGstD version " PACKAGE_VERSION "\n" \
       "Copyright (C) 2015-2021 RidgeRun (https://www.ridgerun.com)\n\n"
 
-/* Shutdown is driven by a dedicated thread that waits for SIGINT/SIGTERM
- * with sigwait(). A GLib signal source would need the main loop to dispatch
- * it, and the main loop is exactly what a stuck pipeline can block: a state
- * change that never returns holds a lock the main thread needs for its own
- * requests, and then a daemon that only quits from the main loop never quits.
- * The thread also bounds the shutdown itself, because stopping the IPC layer
- * waits for request handlers that may be stuck in the same state change. */
+/* Shutdown is driven by a dedicated thread rather than by the main loop. A
+ * GLib signal source needs the main loop to dispatch it, and the main loop
+ * is exactly what a stuck pipeline can block: a state change that never
+ * returns holds a lock the main thread needs for its own requests, and then
+ * a daemon that only quits from the main loop never quits.
+ *
+ * The signal handler writes the signal number to a pipe and the shutdown
+ * thread blocks reading it (the self-pipe pattern g_unix_signal_add() uses
+ * underneath, minus the main loop). The process signal mask is untouched,
+ * so neither the threads GStreamer creates nor the children it spawns (the
+ * plugin scanner, anything a pipeline executes) are affected.
+ *
+ * The first signal quits the main loop and, unless --shutdown-timeout is 0,
+ * starts a deadline after which the process exits regardless, because
+ * stopping the IPC layer waits for request handlers that may be stuck in
+ * the same state change. A second signal exits at once. */
 typedef struct
 {
   GMainLoop *main_loop;
-  guint timeout;
-  sigset_t signals;
+  guint timeout;                /* seconds; 0 waits forever */
+  gint fds[2];                  /* the handler writes, the thread reads */
+
+  GMutex lock;
+  GCond cond;
+  gboolean done;                /* main() finished the clean path */
+  GThread *deadline;            /* started on the first signal */
 } GstdShutdown;
 
 #define GSTD_SHUTDOWN_TIMEOUT_DEFAULT 5
+
+/* gstd -k waits this much longer than the daemon's own deadline, so a
+ * daemon that needs the bounded exit is gone before -k gives up on it */
+#define GSTD_KILL_WAIT_MARGIN 2
+/* With --shutdown-timeout 0 the daemon waits forever; -k cannot, so a day */
+#define GSTD_KILL_WAIT_FOREVER (24 * 60 * 60)
+
+static GstdShutdown shutdown_state = { NULL, 0, {-1, -1}, };
 
 static void print_header ();
 
@@ -59,47 +85,195 @@ print_header (void)
   g_print (HEADER);
 }
 
+static void
+gstd_shutdown_signal_handler (gint signum)
+{
+  const guint8 byte = (guint8) signum;
+  const gint saved_errno = errno;
+  G_GNUC_UNUSED gssize written;
+
+  /* Only write() is async-signal-safe here. A full pipe means earlier
+   * signals are still queued, which is the same outcome. */
+  written = write (shutdown_state.fds[1], &byte, sizeof (byte));
+  errno = saved_errno;
+}
+
+static gboolean
+gstd_shutdown_wait_signal (gint * signum)
+{
+  guint8 byte = 0;
+  gssize n;
+
+  do {
+    n = read (shutdown_state.fds[0], &byte, sizeof (byte));
+  } while (n < 0 && errno == EINTR);
+
+  if (n != sizeof (byte)) {
+    return FALSE;
+  }
+
+  *signum = byte;
+  return TRUE;
+}
+
+static gboolean
+gstd_shutdown_quit (gpointer user_data)
+{
+  g_main_loop_quit ((GMainLoop *) user_data);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+gstd_shutdown_exit_now (const gchar * reason)
+{
+  /* Nothing below us can be waited for any longer, so leave without
+   * running the remaining cleanup. The log line is the only trace. */
+  g_printerr ("%s, exiting now\n", reason);
+  GST_ERROR ("%s, exiting now", reason);
+  _exit (EXIT_FAILURE);
+}
+
+/* With nobody reading the pipe the handlers would swallow every signal.
+ * The default action (terminate at once, no cleanup) keeps gstd stoppable. */
+static void
+gstd_shutdown_restore_default (const gchar * why)
+{
+  const gchar *reason = g_strerror (errno);
+
+  g_printerr ("%s: %s. SIGINT/SIGTERM will now terminate gstd without "
+      "cleanup\n", why, reason);
+  GST_ERROR ("%s: %s. SIGINT/SIGTERM will now terminate gstd without "
+      "cleanup", why, reason);
+  signal (SIGINT, SIG_DFL);
+  signal (SIGTERM, SIG_DFL);
+}
+
+static gpointer
+gstd_shutdown_deadline_thread (gpointer user_data)
+{
+  const guint timeout = shutdown_state.timeout;
+  const gint64 end =
+      g_get_monotonic_time () + (gint64) timeout * G_USEC_PER_SEC;
+  gboolean done;
+
+  g_mutex_lock (&shutdown_state.lock);
+  while (!shutdown_state.done
+      && g_cond_wait_until (&shutdown_state.cond, &shutdown_state.lock, end)) {
+    /* woken before the deadline; re-check */
+  }
+  done = shutdown_state.done;
+  g_mutex_unlock (&shutdown_state.lock);
+
+  if (!done) {
+    gchar *reason =
+        g_strdup_printf ("Shutdown did not complete within %u s", timeout);
+    gstd_shutdown_exit_now (reason);
+  }
+
+  return NULL;
+}
+
 static gpointer
 gstd_shutdown_thread (gpointer user_data)
 {
-  GstdShutdown *shutdown = (GstdShutdown *) user_data;
   gint signum = 0;
+  gboolean done;
 
-  if (sigwait (&shutdown->signals, &signum) != 0) {
+  if (!gstd_shutdown_wait_signal (&signum)) {
+    gstd_shutdown_restore_default ("Unable to wait for shutdown signals");
     return NULL;
   }
 
   GST_INFO ("Signal %d received, shutting down...", signum);
   g_print ("\n");
-  g_main_loop_quit (shutdown->main_loop);
 
-  if (shutdown->timeout == 0) {
-    return NULL;
+  /* Through an idle source rather than g_main_loop_quit() directly: a quit
+   * that lands before g_main_loop_run() is discarded, and the signal may
+   * have arrived before the loop was entered. The idle waits for it. */
+  g_idle_add_full (G_PRIORITY_HIGH, gstd_shutdown_quit,
+      g_main_loop_ref (shutdown_state.main_loop),
+      (GDestroyNotify) g_main_loop_unref);
+
+  g_mutex_lock (&shutdown_state.lock);
+  if (shutdown_state.timeout > 0 && !shutdown_state.done) {
+    shutdown_state.deadline =
+        g_thread_new ("gstd-deadline", gstd_shutdown_deadline_thread, NULL);
+  }
+  g_mutex_unlock (&shutdown_state.lock);
+
+  /* A second signal ends the wait, however long the timeout. Once the
+   * clean path has finished the process is already exiting, and the signal
+   * is ignored rather than turned into a failure. */
+  while (gstd_shutdown_wait_signal (&signum)) {
+    g_mutex_lock (&shutdown_state.lock);
+    done = shutdown_state.done;
+    g_mutex_unlock (&shutdown_state.lock);
+
+    if (!done) {
+      gstd_shutdown_exit_now ("Second signal received before shutdown "
+          "completed");
+    }
   }
 
-  g_usleep ((gulong) shutdown->timeout * G_USEC_PER_SEC);
-
-  /* Still here: a pipeline teardown or request handler is not returning.
-   * Nothing below us can be waited for any longer, so leave without
-   * running the remaining cleanup. The log line is the only trace. */
-  g_printerr ("Shutdown did not complete within %u s, exiting now\n",
-      shutdown->timeout);
-  GST_ERROR ("Shutdown did not complete within %u s, exiting now",
-      shutdown->timeout);
-  _exit (EXIT_FAILURE);
+  gstd_shutdown_restore_default ("Unable to wait for shutdown signals");
   return NULL;
 }
 
-/* Block the shutdown signals in the calling thread. Every thread created
- * afterwards inherits the mask, which leaves sigwait() in the shutdown
- * thread as their only receiver. Must run before any thread exists. */
-static void
-gstd_shutdown_block_signals (GstdShutdown * shutdown)
+/* Routes SIGINT/SIGTERM to the shutdown thread. Returns FALSE, with the
+ * signal dispositions untouched, if the pipe or the thread cannot be made. */
+static gboolean
+gstd_shutdown_start (GMainLoop * main_loop, guint timeout)
 {
-  sigemptyset (&shutdown->signals);
-  sigaddset (&shutdown->signals, SIGINT);
-  sigaddset (&shutdown->signals, SIGTERM);
-  pthread_sigmask (SIG_BLOCK, &shutdown->signals, NULL);
+  struct sigaction action;
+  GError *error = NULL;
+  GThread *thread;
+
+  shutdown_state.main_loop = main_loop;
+  shutdown_state.timeout = timeout;
+
+  if (!g_unix_open_pipe (shutdown_state.fds, FD_CLOEXEC, &error)) {
+    g_printerr ("Unable to create the shutdown pipe: %s\n", error->message);
+    g_error_free (error);
+    return FALSE;
+  }
+
+  thread = g_thread_try_new ("gstd-shutdown", gstd_shutdown_thread, NULL,
+      &error);
+  if (!thread) {
+    g_printerr ("Unable to create the shutdown thread: %s\n", error->message);
+    g_error_free (error);
+    return FALSE;
+  }
+  /* Never joined: it blocks on the pipe until the process exits */
+  g_thread_unref (thread);
+
+  memset (&action, 0, sizeof (action));
+  action.sa_handler = gstd_shutdown_signal_handler;
+  sigemptyset (&action.sa_mask);
+  action.sa_flags = SA_RESTART;
+  sigaction (SIGINT, &action, NULL);
+  sigaction (SIGTERM, &action, NULL);
+
+  return TRUE;
+}
+
+/* Marks the clean path finished and reaps the deadline thread, so it cannot
+ * wake after main() has returned and fail a shutdown that completed. */
+static void
+gstd_shutdown_finish (void)
+{
+  GThread *deadline;
+
+  g_mutex_lock (&shutdown_state.lock);
+  shutdown_state.done = TRUE;
+  deadline = shutdown_state.deadline;
+  shutdown_state.deadline = NULL;
+  g_cond_broadcast (&shutdown_state.cond);
+  g_mutex_unlock (&shutdown_state.lock);
+
+  if (deadline) {
+    g_thread_join (deadline);
+  }
 }
 
 gint
@@ -122,8 +296,7 @@ main (gint argc, gchar * argv[])
   gboolean parent = FALSE;
   gint max_pipelines = -1;      /* -1: option absent, keep env/default */
   gint shutdown_timeout = GSTD_SHUTDOWN_TIMEOUT_DEFAULT;
-  GstdShutdown shutdown = { NULL, 0, };
-  GThread *shutdown_thread = NULL;
+  gint kill_wait;
 
   GstD *gstd = NULL;
 
@@ -161,15 +334,12 @@ main (gint argc, gchar * argv[])
     ,
     {"shutdown-timeout", 0, 0, G_OPTION_ARG_INT, &shutdown_timeout,
           "Seconds to wait for a clean shutdown after SIGINT/SIGTERM before "
-          "exiting regardless (default 5; 0 waits forever)",
+          "exiting regardless (default 5; 0 waits forever). With -k, how "
+          "long to wait for the daemon, plus 2",
         "seconds"}
     ,
     {NULL}
   };
-
-  /* Shutdown signals go to the dedicated thread; see gstd_shutdown_thread.
-   * This has to happen before gstd_new() creates the first thread. */
-  gstd_shutdown_block_signals (&shutdown);
 
   /* Initialize default */
   context = g_option_context_new (" - gst-launch under steroids");
@@ -186,6 +356,12 @@ main (gint argc, gchar * argv[])
     return EXIT_FAILURE;
   }
   g_option_context_free (context);
+
+  /* Before daemonizing, so the message still reaches the terminal */
+  if (shutdown_timeout < 0) {
+    g_printerr ("Ignoring invalid --shutdown-timeout %d\n", shutdown_timeout);
+    shutdown_timeout = GSTD_SHUTDOWN_TIMEOUT_DEFAULT;
+  }
 
   if (!quiet && !kill) {
     print_header ();
@@ -220,7 +396,13 @@ main (gint argc, gchar * argv[])
   gstd_debug_init ();
 
   if (kill) {
-    if (gstd_daemon_stop ()) {
+    if (shutdown_timeout == 0) {
+      kill_wait = GSTD_KILL_WAIT_FOREVER;
+    } else {
+      kill_wait = MIN (shutdown_timeout, G_MAXINT - GSTD_KILL_WAIT_MARGIN)
+          + GSTD_KILL_WAIT_MARGIN;
+    }
+    if (gstd_daemon_stop (kill_wait)) {
       GST_INFO ("Gstd successfully stopped");
     }
     goto out;
@@ -254,32 +436,30 @@ main (gint argc, gchar * argv[])
     g_printerr ("Ignoring invalid --max-pipelines %d\n", max_pipelines);
   }
 
-  /* Start IPC subsystem */
-  if (!gstd_start (gstd)) {
-    goto error;
-  }
-
   /* Starting the application's main loop, necessary for 
      messaging and signaling subsystem */
   main_loop = g_main_loop_new (NULL, FALSE);
 
-  /* Wait for SIGINT/SIGTERM off the main loop, and bound the shutdown */
-  if (shutdown_timeout < 0) {
-    g_printerr ("Ignoring invalid --shutdown-timeout %d\n", shutdown_timeout);
-    shutdown_timeout = GSTD_SHUTDOWN_TIMEOUT_DEFAULT;
+  /* Receive SIGINT/SIGTERM off the main loop, and bound the shutdown.
+   * Before the IPC layer accepts connections, so a signal that arrives
+   * while it starts is held for the loop instead of killing the daemon. */
+  if (!gstd_shutdown_start (main_loop, (guint) shutdown_timeout)) {
+    g_printerr ("Falling back to main-loop signal handling\n");
+    g_unix_signal_add (SIGINT, gstd_shutdown_quit, main_loop);
+    g_unix_signal_add (SIGTERM, gstd_shutdown_quit, main_loop);
   }
-  shutdown.main_loop = main_loop;
-  shutdown.timeout = (guint) shutdown_timeout;
-  shutdown_thread =
-      g_thread_new ("gstd-shutdown", gstd_shutdown_thread, &shutdown);
+
+  /* Start IPC subsystem */
+  if (!gstd_start (gstd)) {
+    g_main_loop_unref (main_loop);
+    main_loop = NULL;
+    goto error;
+  }
 
   GST_INFO ("Gstd started");
   g_main_loop_run (main_loop);
 
-  /* Application shut down. The shutdown thread is still sleeping towards
-   * its deadline, or already gone; either way it must not be joined. */
-  g_thread_unref (shutdown_thread);
-  shutdown_thread = NULL;
+  /* Application shut down */
   g_main_loop_unref (main_loop);
   main_loop = NULL;
 
@@ -306,6 +486,7 @@ out:
      * pipeline that is still PLAYING never returns its streaming threads. */
     gstd_free (gstd);
     gst_deinit ();
+    gstd_shutdown_finish ();
     return ret;
   }
 }

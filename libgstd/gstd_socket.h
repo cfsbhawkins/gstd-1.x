@@ -39,11 +39,13 @@ G_BEGIN_DECLS
   (G_TYPE_INSTANCE_GET_CLASS ((obj), GSTD_TYPE_SOCKET, GstdSocketClass))
 typedef struct _GstdSocket GstdSocket;
 typedef struct _GstdSocketClass GstdSocketClass;
+typedef struct _GstdSocketRun GstdSocketRun;
 
 struct _GstdSocket
 {
   GstdIpc parent;
   GSocketService *service;
+  GstdSocketRun *run;           /* shared with the service's "run" handler */
 };
 
 struct _GstdSocketClass

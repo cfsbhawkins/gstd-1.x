@@ -66,10 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatched the signal and the daemon ignored `SIGTERM` until it was
   killed. Even when the loop did quit, stopping the HTTP server waits for
   every request handler, including one stuck in that state change. The
-  signals are now blocked in every thread and received with `sigwait()` by
-  a dedicated thread that quits the main loop and, after
-  `--shutdown-timeout` seconds (default 5; `0` waits forever), exits with
-  status 1 and a log line if the clean path has not finished.
+  signal handler now writes to a pipe that a dedicated thread reads (the
+  process signal mask is untouched, so threads and child processes such as
+  the plugin scanner are unaffected). The first signal quits the main loop
+  and, after `--shutdown-timeout` seconds (default 5; `0` waits forever),
+  exits with status 1 and a log line if the clean path has not finished; a
+  second signal exits at once. A signal that arrives before the main loop
+  is entered is honoured rather than lost, and a shutdown that completes
+  near the deadline is never reported as a failure. `gstd -k` waits for the
+  daemon's deadline plus 2 s (it honours `--shutdown-timeout` too) and, if
+  the daemon is still running after that, says so and leaves its pid file
+  alone instead of removing it from under the live process.
+- **TCP/Unix socket handlers could outlive the session** (`gstd_socket.c`).
+  The service's `run` handler took the session as plain user data and was
+  dispatched on a pool thread, so a connection accepted just before
+  shutdown could run its handler after the session had been freed and
+  crash. Stopping the socket also never unblocked handlers waiting on a
+  connected client. The handler now shares a reference-counted context
+  with the socket that records whether the session may still be used;
+  stop refuses further handlers, cancels every pending read and waits for
+  the running handlers to finish before the session is released.
 - **Shutdown with a PLAYING pipeline never finished** (`gstd.c`).
   `main()` called `gst_deinit()` before `gstd_free()`, so GStreamer waited
   for its task pool threads while the pipelines that owned them were still

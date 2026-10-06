@@ -64,4 +64,7 @@ pipeline that never finishes a state change still shuts down. The same
 thread bounds the shutdown: `--shutdown-timeout <seconds>` (default 5)
 is how long gstd waits for pipelines and request handlers to wind down
 before it exits anyway, with exit status 1 and a log line. `0` waits
-forever, which is the previous behaviour.
+forever, which is the previous behaviour; a second signal exits at once
+in either case. `gstd -k` waits for the daemon's deadline plus 2 s, so
+pass the same `--shutdown-timeout` to `-k` that the daemon was started
+with when it is not the default.

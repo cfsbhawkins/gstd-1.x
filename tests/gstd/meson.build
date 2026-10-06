@@ -10,11 +10,13 @@ gstd_tests = [
   ['test_gstd_childproxy_property.c'],
   ['test_gstd_pipeline_limit.c'],
   ['test_gstd_http.c'],
+  ['test_gstd_shutdown.c'],
 ]
 
 # Add C Definitions for tests
 test_defines = [
   '-DTESTFILE="' + meson.current_source_dir() + '/meson.build"',
+  '-DGSTD_BINARY="' + gstd_exe.full_path() + '"',
 ]
 
 plugins_dir = []
