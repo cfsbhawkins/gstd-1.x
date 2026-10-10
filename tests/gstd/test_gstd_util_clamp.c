@@ -32,6 +32,8 @@
 
 #include <gst/check/gstcheck.h>
 
+#include <errno.h>
+
 #include "gstd_list.h"
 #include "gstd_session.h"
 #include "gstd_util_clamp.h"
@@ -452,6 +454,355 @@ GST_START_TEST (test_clamp_concurrent_churn_settles)
 
 GST_END_TEST;
 
+/*
+ * A fake kernel. Every thread starts as a normal thread with no clamp;
+ * tests mark threads real-time or capped, and make set_min fail for one
+ * thread or for everyone. GSTD_UTIL_CLAMP_RESET is recorded as 0.
+ */
+#ifdef __linux__
+#define FAKE_ANY_TID -1
+#define FAKE_SCHED_FIFO 1
+
+static GHashTable *fake_threads = NULL;
+static GMutex fake_mutex;
+typedef struct
+{
+  gint tid;
+  guint value;
+  gint error;
+  gint times;
+} FakeFault;
+
+/* Up to two armed faults, matched in order */
+static FakeFault fake_faults[2];
+static gboolean fake_no_reset = FALSE;
+static guint fake_set_calls = 0;
+
+static GstdUtilClampThread *
+fake_thread (gint tid)
+{
+  GstdUtilClampThread *thread =
+      g_hash_table_lookup (fake_threads, GINT_TO_POINTER (tid));
+
+  if (!thread) {
+    thread = g_new0 (GstdUtilClampThread, 1);
+    thread->util_max = GSTD_UTIL_CLAMP_SCALE;
+    g_hash_table_insert (fake_threads, GINT_TO_POINTER (tid), thread);
+  }
+  return thread;
+}
+
+static gint
+fake_get (gint tid, GstdUtilClampThread * out)
+{
+  g_mutex_lock (&fake_mutex);
+  *out = *fake_thread (tid);
+  g_mutex_unlock (&fake_mutex);
+  return 0;
+}
+
+/* Fails when the tid and the value match an armed fault, a set number of
+ * times (-1: always). A value of 0 in a fault matches any value. */
+static gint
+fake_set_min (gint tid, guint util_min)
+{
+  gint error = 0;
+  guint i;
+
+  g_mutex_lock (&fake_mutex);
+  fake_set_calls++;
+  for (i = 0; i < G_N_ELEMENTS (fake_faults) && error == 0; i++) {
+    FakeFault *fault = &fake_faults[i];
+
+    if (fault->error != 0 && fault->times != 0
+        && (fault->tid == FAKE_ANY_TID || fault->tid == tid)
+        && (fault->value == 0 || fault->value == util_min)) {
+      error = fault->error;
+      if (fault->times > 0)
+        fault->times--;
+    }
+  }
+  if (error == 0 && util_min == GSTD_UTIL_CLAMP_RESET && fake_no_reset)
+    error = EINVAL;
+  if (error == 0)
+    fake_thread (tid)->util_min =
+        util_min == GSTD_UTIL_CLAMP_RESET ? 0 : util_min;
+  g_mutex_unlock (&fake_mutex);
+  return error;
+}
+
+static const GstdUtilClampBackend fake_backend = { fake_get, fake_set_min };
+
+static gint
+own_tid (void)
+{
+  return (gint) syscall (SYS_gettid);
+}
+
+static guint
+fake_util_min (gint tid)
+{
+  guint value;
+
+  g_mutex_lock (&fake_mutex);
+  value = fake_thread (tid)->util_min;
+  g_mutex_unlock (&fake_mutex);
+  return value;
+}
+
+static void
+fake_arm_slot (guint slot, gint tid, guint value, gint error, gint times)
+{
+  g_mutex_lock (&fake_mutex);
+  fake_faults[slot].tid = tid;
+  fake_faults[slot].value = value;
+  fake_faults[slot].error = error;
+  fake_faults[slot].times = times;
+  g_mutex_unlock (&fake_mutex);
+}
+
+/* Arms one fault and clears the other; all zeros clears both */
+static void
+fake_arm (gint tid, guint value, gint error, gint times)
+{
+  fake_arm_slot (0, tid, value, error, times);
+  fake_arm_slot (1, 0, 0, 0, 0);
+}
+
+/* A second thread that stays alive, and listed, for the whole test */
+static GMutex parked_mutex;
+static GCond parked_cond;
+static gboolean parked_release = FALSE;
+static gint parked_tid = 0;
+
+static gpointer
+parked_thread (gpointer data)
+{
+  g_mutex_lock (&parked_mutex);
+  parked_tid = own_tid ();
+  g_cond_broadcast (&parked_cond);
+  while (!parked_release)
+    g_cond_wait (&parked_cond, &parked_mutex);
+  g_mutex_unlock (&parked_mutex);
+  return NULL;
+}
+
+static GThread *parked = NULL;
+
+static void
+fake_setup (void)
+{
+  fake_threads = g_hash_table_new_full (NULL, NULL, NULL, g_free);
+  fake_arm (0, 0, 0, 0);
+  fake_no_reset = FALSE;
+  fake_set_calls = 0;
+  gstd_util_clamp_set_backend (&fake_backend);
+
+  parked_release = FALSE;
+  parked_tid = 0;
+  parked = g_thread_new ("parked", parked_thread, NULL);
+  g_mutex_lock (&parked_mutex);
+  while (parked_tid == 0)
+    g_cond_wait (&parked_cond, &parked_mutex);
+  g_mutex_unlock (&parked_mutex);
+
+  g_setenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN", "512", TRUE);
+}
+
+static void
+fake_teardown (void)
+{
+  g_mutex_lock (&parked_mutex);
+  parked_release = TRUE;
+  g_cond_broadcast (&parked_cond);
+  g_mutex_unlock (&parked_mutex);
+  g_thread_join (parked);
+
+  gstd_util_clamp_set_backend (NULL);
+  g_hash_table_unref (fake_threads);
+  fake_threads = NULL;
+  g_unsetenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN");
+}
+
+GST_START_TEST (test_fake_partial_release_restores_floor)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_partial_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+
+  /* This thread refuses the release; the parked one has already gone */
+  fake_arm (own_tid (), GSTD_UTIL_CLAMP_RESET, EBUSY, -1);
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+  /* Put back, so the next pipeline does not run with it down */
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  /* And the retry at the next empty list releases everything */
+  fake_arm (0, 0, 0, 0);
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p1"));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_failed_restore_reraises_next_pipeline)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_restore_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+
+  /* The release fails on this thread after the parked one has gone, and
+   * putting the parked one back fails too */
+  fake_arm (own_tid (), GSTD_UTIL_CLAMP_RESET, EBUSY, -1);
+  fake_arm_slot (1, parked_tid, 512, EBUSY, -1);
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  /* Nothing fails any more: the next pipeline must raise the floor */
+  fake_arm (0, 0, 0, 0);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_realtime_threads_untouched)
+{
+  GstdSession *test_session;
+  GstdObject *node;
+  guint calls;
+
+  /* A real-time thread under the kernel's default boost, and a kernel
+   * without the reset value (before 5.11) */
+  g_mutex_lock (&fake_mutex);
+  fake_thread (own_tid ())->policy = FAKE_SCHED_FIFO;
+  fake_thread (own_tid ())->util_min = 1024;
+  g_mutex_unlock (&fake_mutex);
+  fake_no_reset = TRUE;
+  g_setenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN", "1024", TRUE);
+
+  test_session = gstd_session_new ("Fake_rt_session");
+  node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (1024, fake_util_min (parked_tid));
+
+  calls = fake_set_calls;
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  /* The normal thread falls back to 0; the real-time one is never written */
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+  fail_unless_equals_int (1024, fake_util_min (own_tid ()));
+  fail_unless (fake_set_calls > calls);
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+  fail_unless_equals_int (1024, fake_util_min (own_tid ()));
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_capped_thread_skipped)
+{
+  GstdSession *test_session;
+  GstdObject *node;
+
+  /* Its maximum clamp is below the floor; asking would be EINVAL */
+  g_mutex_lock (&fake_mutex);
+  fake_thread (own_tid ())->util_max = 256;
+  g_mutex_unlock (&fake_mutex);
+
+  test_session = gstd_session_new ("Fake_capped_session");
+  node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_transient_error_retried)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_transient_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  fake_arm (FAKE_ANY_TID, 0, EINVAL, -1);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+
+  /* Not "unsupported": the next pipeline tries again */
+  fake_arm (0, 0, 0, 0);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_unsupported_kernel_disables)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_unsupported_session");
+  GstdObject *node = pipelines_of (test_session);
+  guint calls;
+
+  fake_arm (FAKE_ANY_TID, 0, EOPNOTSUPP, -1);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+
+  /* Never asked again for the life of the session */
+  fake_arm (0, 0, 0, 0);
+  calls = fake_set_calls;
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (calls, fake_set_calls);
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_dispose_retries_release)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_dispose_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  gst_object_unref (node);
+
+  /* The first release attempt fails on this thread only */
+  fake_arm (own_tid (), GSTD_UTIL_CLAMP_RESET, EBUSY, 1);
+  gst_object_unref (test_session);
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+}
+
+GST_END_TEST;
+#endif
+
 static Suite *
 gstd_util_clamp_suite (void)
 {
@@ -473,6 +824,23 @@ gstd_util_clamp_suite (void)
   tcase_add_test (tc, test_clamp_concurrent_churn_settles);
   tcase_add_test (tc, test_clamp_off_by_default);
   tcase_add_test (tc, test_clamp_invalid_value_ignored);
+
+#ifdef __linux__
+  {
+    TCase *fake = tcase_create ("fake kernel");
+
+    suite_add_tcase (suite, fake);
+    tcase_set_timeout (fake, 30);
+    tcase_add_checked_fixture (fake, fake_setup, fake_teardown);
+    tcase_add_test (fake, test_fake_partial_release_restores_floor);
+    tcase_add_test (fake, test_fake_failed_restore_reraises_next_pipeline);
+    tcase_add_test (fake, test_fake_realtime_threads_untouched);
+    tcase_add_test (fake, test_fake_capped_thread_skipped);
+    tcase_add_test (fake, test_fake_transient_error_retried);
+    tcase_add_test (fake, test_fake_unsupported_kernel_disables);
+    tcase_add_test (fake, test_fake_dispose_retries_release);
+  }
+#endif
 
   return suite;
 }

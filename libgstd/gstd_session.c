@@ -31,6 +31,8 @@
 #include "gstd_pipeline_deleter.h"
 #include "gstd_util_clamp.h"
 
+#include <errno.h>
+
 /* Gstd Session debugging category */
 GST_DEBUG_CATEGORY_STATIC (gstd_session_debug);
 #define GST_CAT_DEFAULT gstd_session_debug
@@ -242,7 +244,9 @@ gstd_session_set_property (GObject * object,
 /* Holds the clamp while the session has pipelines. Runs on whichever
  * thread created or deleted a pipeline, so it reconciles against the
  * current count under the mutex rather than trusting the order in which
- * concurrent notifications arrive. */
+ * concurrent notifications arrive. A failed transition is retried at the
+ * next count change, except when the kernel has no utilization clamping
+ * or refuses every thread, neither of which changes while gstd runs. */
 static void
 gstd_session_on_pipeline_count (GObject * list, GParamSpec * pspec,
     gpointer user_data)
@@ -265,40 +269,41 @@ gstd_session_on_pipeline_count (GObject * list, GParamSpec * pspec,
 
   if (want) {
     error = gstd_util_clamp_raise (self->util_clamp_min, &updated);
-    if (error != 0 && updated == 0) {
-      /* Refused for every thread: the kernel or the process's privileges
-       * will not change while gstd runs, so stop trying */
-      if (gstd_util_clamp_unsupported (error)) {
-        GST_WARNING_OBJECT (self, "This kernel cannot clamp CPU "
-            "utilization (%s); pipelines will run without a clock floor",
-            g_strerror (error));
-      } else {
-        GST_WARNING_OBJECT (self, "Cannot clamp CPU utilization (%s); "
-            "pipelines will run without a clock floor. Changing utilization "
-            "clamps usually requires CAP_SYS_NICE", g_strerror (error));
-      }
+    if (error != 0 && (gstd_util_clamp_unsupported (error)
+            || (error == EPERM && updated == 0))) {
+      GST_WARNING_OBJECT (self, "Cannot clamp CPU utilization: %s (errno "
+          "%d). Pipelines will run without a clock floor.%s",
+          g_strerror (error), error, error == EPERM ?
+          " Changing utilization clamps usually requires CAP_SYS_NICE." : "");
       self->util_clamp_min = 0;
       goto out;
     }
     if (error != 0) {
       GST_WARNING_OBJECT (self, "Raised the CPU utilization clamp on %u "
-          "threads, but not on every thread: %s", updated,
-          g_strerror (error));
+          "threads but not all: %s (errno %d); will retry", updated,
+          g_strerror (error), error);
+      /* Threads that did change still need releasing later */
+      if (updated == 0)
+        goto out;
     }
   } else {
     error = gstd_util_clamp_release (self->util_clamp_min, &updated);
     if (error != 0) {
-      /* Stay active so the next time the last pipeline goes, this runs
-       * again */
-      GST_WARNING_OBJECT (self, "Could not clear the CPU utilization clamp "
-          "on every thread (%s); will retry", g_strerror (error));
+      GST_WARNING_OBJECT (self, "Could not release the CPU utilization "
+          "clamp on every thread: %s (errno %d); will retry",
+          g_strerror (error), error);
+      /* Put back what the partial release took, so the session's state
+       * matches the threads again. If that fails too, record the floor
+       * as down so the next pipeline raises it. */
+      if (updated > 0 && gstd_util_clamp_raise (self->util_clamp_min, NULL))
+        self->util_clamp_active = FALSE;
       goto out;
     }
   }
 
   self->util_clamp_active = want;
   GST_INFO_OBJECT (self, "%s the CPU utilization clamp on %u threads "
-      "(%u pipelines)", want ? "Raised" : "Cleared", updated, count);
+      "(%u pipelines)", want ? "Raised" : "Released", updated, count);
 
 out:
   g_mutex_unlock (&self->util_clamp_mutex);
@@ -318,9 +323,22 @@ gstd_session_dispose (GObject * object)
     self->pipelines = NULL;
   }
 
+  /* The session is the only owner of the clamp, and nothing will retry
+   * once it is gone */
   g_mutex_lock (&self->util_clamp_mutex);
   if (self->util_clamp_active) {
-    gstd_util_clamp_release (self->util_clamp_min, NULL);
+    gint error = 0;
+    gint attempt;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+      error = gstd_util_clamp_release (self->util_clamp_min, NULL);
+      if (error == 0)
+        break;
+    }
+    if (error != 0) {
+      GST_WARNING_OBJECT (self, "Could not release the CPU utilization "
+          "clamp on every thread: %s (errno %d)", g_strerror (error), error);
+    }
     self->util_clamp_active = FALSE;
   }
   g_mutex_unlock (&self->util_clamp_mutex);

@@ -125,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises the minimum utilization clamp of gstd's threads when the first
   pipeline is created and releases it when the last is deleted, so a
   governor that honors utilization clamps clocks up for a pipeline
-  whose load is spread thin. Threads clamped higher are left alone.
+  whose load is spread thin. Real-time threads, and threads clamped
+  higher, are left alone.
   Needs a kernel with utilization clamping and usually `CAP_SYS_NICE`;
   otherwise gstd warns once and runs unclamped. `GstdList` now notifies
   `count` when children are added or removed.

@@ -33,6 +33,12 @@ G_BEGIN_DECLS
 #define GSTD_UTIL_CLAMP_SCALE 1024
 
 /**
+ * Minimum clamp value that returns a thread to the kernel default
+ * (Linux 5.11 and later).
+ */
+#define GSTD_UTIL_CLAMP_RESET G_MAXUINT32
+
+/**
  * Parses a minimum utilization clamp, as given to GSTD_PIPELINE_UTIL_CLAMP_MIN.
  *
  * \param str The value to parse
@@ -45,29 +51,30 @@ gboolean gstd_util_clamp_parse (const gchar * str, guint * value);
 
 /**
  * Raises the minimum utilization clamp of every thread in this process
- * that is below \p value to \p value. Threads already at or above it,
- * such as real-time threads under the kernel's default boost, are left
- * alone. Threads created afterwards inherit the clamp of the thread that
- * creates them.
+ * that is below \p value to \p value. Left alone: threads already at or
+ * above it, threads whose maximum clamp is below it, and real-time and
+ * deadline threads, which keep the kernel's own boost. Threads created
+ * afterwards inherit the clamp of the thread that creates them; one that
+ * later switches to a real-time policy keeps it until the release.
  *
  * \param value The minimum clamp, from 1 to GSTD_UTIL_CLAMP_SCALE
  * \param updated (out) (optional) How many threads were changed
  *
- * \return 0 when every thread is at or above \p value, otherwise the errno
- * of the first thread that could not be changed.
+ * \return 0 when every thread was seen in the wanted state, otherwise the
+ * errno of the first thread that could not be changed.
  */
 gint gstd_util_clamp_raise (guint value, guint * updated);
 
 /**
- * Returns every thread whose minimum clamp is still exactly \p value to
- * the kernel default, undoing gstd_util_clamp_raise() without touching a
- * clamp something else has set since.
+ * Returns every non-real-time thread whose minimum clamp is still exactly
+ * \p value to the kernel default (0 before Linux 5.11), undoing
+ * gstd_util_clamp_raise() without touching a clamp something else has set.
  *
  * \param value The value gstd_util_clamp_raise() set
  * \param updated (out) (optional) How many threads were changed
  *
- * \return 0 on success, otherwise the errno of the first thread that could
- * not be changed.
+ * \return 0 when every thread was seen in the wanted state, otherwise the
+ * errno of the first thread that could not be changed.
  */
 gint gstd_util_clamp_release (guint value, guint * updated);
 
@@ -78,6 +85,33 @@ gint gstd_util_clamp_release (guint value, guint * updated);
  * all: before Linux 5.3, or built without CONFIG_UCLAMP_TASK.
  */
 gboolean gstd_util_clamp_unsupported (gint error);
+
+/**
+ * The scheduling state of one thread, as far as clamping is concerned.
+ */
+typedef struct _GstdUtilClampThread
+{
+  guint policy;
+  guint util_min;
+  guint util_max;
+} GstdUtilClampThread;
+
+/**
+ * How the module reads and changes a thread. Both return 0 or an errno.
+ * set_min changes only the minimum clamp; \p util_min may be
+ * GSTD_UTIL_CLAMP_RESET.
+ */
+typedef struct _GstdUtilClampBackend
+{
+  gint (*get) (gint tid, GstdUtilClampThread * thread);
+  gint (*set_min) (gint tid, guint util_min);
+} GstdUtilClampBackend;
+
+/**
+ * Replaces the kernel calls, so tests can exercise failures and policies
+ * the running kernel cannot produce. NULL restores the kernel.
+ */
+void gstd_util_clamp_set_backend (const GstdUtilClampBackend * backend);
 
 G_END_DECLS
 #endif //__GSTD_UTIL_CLAMP_H__

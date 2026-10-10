@@ -65,9 +65,12 @@ offloaded to hardware, falls behind real time. Setting
 threads that minimum utilization clamp while at least one pipeline
 exists. The clamp is raised when the first pipeline is created and
 released when the last one is deleted; threads started in between,
-such as streaming threads, inherit it. Threads already clamped higher,
-including real-time threads under the kernel's default boost, are left
-alone, and releasing only touches threads still at gstd's value.
+such as streaming threads, inherit it. Real-time and deadline threads
+are never written, so they keep the kernel's own boost; a thread that
+switches to a real-time policy while the floor is held keeps gstd's
+value until it is released. Threads already clamped higher, or whose
+maximum clamp is below the floor, are left alone, and releasing only
+touches threads still at gstd's value.
 
 What the clamp does depends on the governor. `schedutil` and governors
 built on the same utilization signal raise the clock whenever a
@@ -83,7 +86,8 @@ default) could cancel it.
 It needs Linux 5.3 or later with utilization clamping
 (`CONFIG_UCLAMP_TASK`), and changing a clamp usually requires
 `CAP_SYS_NICE`. Without either, gstd logs one warning and runs
-unclamped. Unset by default.
+unclamped. Any other failure is logged and retried the next time the
+pipeline count changes. Unset by default.
 
 ## Shutdown (this fork)
 
