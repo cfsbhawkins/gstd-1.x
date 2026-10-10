@@ -60,6 +60,7 @@ libgstd_@GSTD_API_VERSION@_la_SOURCES =             \
              gstd_state.c                           \
              gstd_tcp.c                             \
              gstd_unix.c                            \
+             gstd_util_clamp.c                      \
              libgstd.c
 
 libgstd_@GSTD_API_VERSION@_la_CFLAGS =                         \
@@ -135,4 +136,5 @@ noinst_HEADERS =                                   \
              gstd_socket.h                         \
              gstd_state.h                          \
              gstd_tcp.h                            \
-             gstd_unix.h
+             gstd_unix.h                           \
+             gstd_util_clamp.h

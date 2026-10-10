@@ -211,6 +211,22 @@ struct _GstdSession
    * Object containing debug options
    */
   GstdDebug *debug;
+
+  /*
+   * Minimum utilization clamp held while any pipeline exists, from
+   * GSTD_PIPELINE_UTIL_CLAMP_MIN; 0 when off or no longer possible
+   */
+  guint util_clamp_min;
+
+  /*
+   * Whether the clamp is currently applied
+   */
+  gboolean util_clamp_active;
+
+  /*
+   * Serializes clamp changes from concurrent pipeline creates and deletes
+   */
+  GMutex util_clamp_mutex;
 };
 
 struct _GstdSessionClass

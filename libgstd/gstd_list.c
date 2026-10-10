@@ -49,6 +49,9 @@ GST_DEBUG_CATEGORY_STATIC (gstd_list_debug);
 
 #define GSTD_DEBUG_DEFAULT_LEVEL GST_LEVEL_INFO
 
+/* Kept to notify "count" when children are added or removed */
+static GParamSpec *count_pspec = NULL;
+
 /* VTable */
 static gint gstd_list_find_node (gconstpointer, gconstpointer);
 static GstdReturnCode
@@ -106,6 +109,7 @@ gstd_list_class_init (GstdListClass * klass)
       0, G_MAXUINT, GSTD_LIST_DEFAULT_MAX_CHILDREN, G_PARAM_READWRITE);
 
   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
+  count_pspec = properties[PROP_COUNT];
 
   gstd_object_class->create = gstd_list_create;
   gstd_object_class->delete = gstd_list_delete;
@@ -258,6 +262,7 @@ gstd_list_commit_reserved (GstdList * self, GstdObject * child)
   GST_OBJECT_UNLOCK (self);
   GST_INFO_OBJECT (self, "Appended %s to %s list", GSTD_OBJECT_NAME (child),
       GSTD_OBJECT_NAME (self));
+  g_object_notify_by_pspec (G_OBJECT (self), count_pspec);
 
   return TRUE;
 }
@@ -365,6 +370,7 @@ gstd_list_delete (GstdObject * object, const gchar * node)
 
   self->list = g_list_delete_link (self->list, found);
   GST_OBJECT_UNLOCK (self);
+  g_object_notify_by_pspec (G_OBJECT (self), count_pspec);
 
   return ret;
 
@@ -477,6 +483,7 @@ gstd_list_append_child (GstdList * self, GstdObject * child)
   GST_OBJECT_UNLOCK (self);
   GST_INFO_OBJECT (self, "Appended %s to %s list", GSTD_OBJECT_NAME (child),
       GSTD_OBJECT_NAME (self));
+  g_object_notify_by_pspec (G_OBJECT (self), count_pspec);
 
   return TRUE;
 

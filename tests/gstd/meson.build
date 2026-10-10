@@ -11,6 +11,7 @@ gstd_tests = [
   ['test_gstd_pipeline_limit.c'],
   ['test_gstd_http.c'],
   ['test_gstd_shutdown.c'],
+  ['test_gstd_util_clamp.c'],
 ]
 
 # Add C Definitions for tests

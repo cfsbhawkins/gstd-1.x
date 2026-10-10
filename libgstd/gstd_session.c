@@ -29,6 +29,9 @@
 #include "gstd_property_reader.h"
 #include "gstd_list_reader.h"
 #include "gstd_pipeline_deleter.h"
+#include "gstd_util_clamp.h"
+
+#include <errno.h>
 
 /* Gstd Session debugging category */
 GST_DEBUG_CATEGORY_STATIC (gstd_session_debug);
@@ -57,6 +60,9 @@ gstd_session_set_property (GObject *, guint, const GValue *, GParamSpec *);
 static void gstd_session_get_property (GObject *, guint, GValue *,
     GParamSpec *);
 static void gstd_session_dispose (GObject *);
+static void gstd_session_finalize (GObject *);
+static void gstd_session_on_pipeline_count (GObject *, GParamSpec *,
+    gpointer);
 
 /* Singleton instance using thread-safe weak reference */
 static GWeakRef the_session_ref;
@@ -72,6 +78,7 @@ gstd_session_class_init (GstdSessionClass * klass)
   object_class->set_property = gstd_session_set_property;
   object_class->get_property = gstd_session_get_property;
   object_class->dispose = gstd_session_dispose;
+  object_class->finalize = gstd_session_finalize;
 
   properties[PROP_PIPELINES] =
       g_param_spec_object ("pipelines",
@@ -146,6 +153,32 @@ gstd_session_init (GstdSession * self)
     }
   }
 
+  /* Optional CPU clock floor while pipelines exist. A governor that
+   * judges load per core can keep clocks low while a pipeline spread over
+   * several threads falls behind real time. A minimum utilization clamp
+   * asks a governor that honors it to clock up whenever gstd's threads
+   * run. Without kernel support or the privilege to set it, gstd warns
+   * once and runs unclamped. */
+  g_mutex_init (&self->util_clamp_mutex);
+  {
+    const gchar *clamp_env = g_getenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN");
+    if (clamp_env && clamp_env[0] != '\0') {
+      guint clamp = 0;
+      if (gstd_util_clamp_parse (clamp_env, &clamp)) {
+        self->util_clamp_min = clamp;
+        g_signal_connect_object (self->pipelines, "notify::count",
+            G_CALLBACK (gstd_session_on_pipeline_count), self, 0);
+        GST_INFO_OBJECT (self, "Pipelines will hold a minimum CPU "
+            "utilization clamp of %u/%u (GSTD_PIPELINE_UTIL_CLAMP_MIN)",
+            clamp, GSTD_UTIL_CLAMP_SCALE);
+      } else {
+        GST_WARNING_OBJECT (self,
+            "Ignoring invalid GSTD_PIPELINE_UTIL_CLAMP_MIN \"%s\" "
+            "(expected 1 to %u)", clamp_env, GSTD_UTIL_CLAMP_SCALE);
+      }
+    }
+  }
+
   self->debug =
       GSTD_DEBUG (g_object_new (GSTD_TYPE_DEBUG, "name", "Debug", NULL));
 
@@ -208,6 +241,74 @@ gstd_session_set_property (GObject * object,
   }
 }
 
+/* Holds the clamp while the session has pipelines. Runs on whichever
+ * thread created or deleted a pipeline, so it reconciles against the
+ * current count under the mutex rather than trusting the order in which
+ * concurrent notifications arrive. A failed transition is retried at the
+ * next count change, except when the kernel has no utilization clamping
+ * or refuses every thread, neither of which changes while gstd runs. */
+static void
+gstd_session_on_pipeline_count (GObject * list, GParamSpec * pspec,
+    gpointer user_data)
+{
+  GstdSession *self = GSTD_SESSION (user_data);
+  guint count = 0;
+  guint updated = 0;
+  gboolean want;
+  gint error;
+
+  g_mutex_lock (&self->util_clamp_mutex);
+
+  if (self->util_clamp_min == 0)
+    goto out;
+
+  g_object_get (list, "count", &count, NULL);
+  want = count > 0;
+  if (want == self->util_clamp_active)
+    goto out;
+
+  if (want) {
+    error = gstd_util_clamp_raise (self->util_clamp_min, &updated);
+    if (error != 0 && (gstd_util_clamp_unsupported (error)
+            || (error == EPERM && updated == 0))) {
+      GST_WARNING_OBJECT (self, "Cannot clamp CPU utilization: %s (errno "
+          "%d). Pipelines will run without a clock floor.%s",
+          g_strerror (error), error, error == EPERM ?
+          " Changing utilization clamps usually requires CAP_SYS_NICE." : "");
+      self->util_clamp_min = 0;
+      goto out;
+    }
+    if (error != 0) {
+      GST_WARNING_OBJECT (self, "Raised the CPU utilization clamp on %u "
+          "threads but not all: %s (errno %d); will retry", updated,
+          g_strerror (error), error);
+      /* Threads that did change still need releasing later */
+      if (updated == 0)
+        goto out;
+    }
+  } else {
+    error = gstd_util_clamp_release (self->util_clamp_min, &updated);
+    if (error != 0) {
+      GST_WARNING_OBJECT (self, "Could not release the CPU utilization "
+          "clamp on every thread: %s (errno %d); will retry",
+          g_strerror (error), error);
+      /* Put back what the partial release took, so the session's state
+       * matches the threads again. If that fails too, record the floor
+       * as down so the next pipeline raises it. */
+      if (updated > 0 && gstd_util_clamp_raise (self->util_clamp_min, NULL))
+        self->util_clamp_active = FALSE;
+      goto out;
+    }
+  }
+
+  self->util_clamp_active = want;
+  GST_INFO_OBJECT (self, "%s the CPU utilization clamp on %u threads "
+      "(%u pipelines)", want ? "Raised" : "Released", updated, count);
+
+out:
+  g_mutex_unlock (&self->util_clamp_mutex);
+}
+
 static void
 gstd_session_dispose (GObject * object)
 {
@@ -216,9 +317,31 @@ gstd_session_dispose (GObject * object)
   GST_INFO_OBJECT (object, "Deinitializing gstd session");
 
   if (self->pipelines) {
+    g_signal_handlers_disconnect_by_func (self->pipelines,
+        gstd_session_on_pipeline_count, self);
     g_object_unref (self->pipelines);
     self->pipelines = NULL;
   }
+
+  /* The session is the only owner of the clamp, and nothing will retry
+   * once it is gone */
+  g_mutex_lock (&self->util_clamp_mutex);
+  if (self->util_clamp_active) {
+    gint error = 0;
+    gint attempt;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+      error = gstd_util_clamp_release (self->util_clamp_min, NULL);
+      if (error == 0)
+        break;
+    }
+    if (error != 0) {
+      GST_WARNING_OBJECT (self, "Could not release the CPU utilization "
+          "clamp on every thread: %s (errno %d)", g_strerror (error), error);
+    }
+    self->util_clamp_active = FALSE;
+  }
+  g_mutex_unlock (&self->util_clamp_mutex);
 
   if (self->debug) {
     g_object_unref (self->debug);
@@ -226,6 +349,16 @@ gstd_session_dispose (GObject * object)
   }
 
   G_OBJECT_CLASS (gstd_session_parent_class)->dispose (object);
+}
+
+static void
+gstd_session_finalize (GObject * object)
+{
+  GstdSession *self = GSTD_SESSION (object);
+
+  g_mutex_clear (&self->util_clamp_mutex);
+
+  G_OBJECT_CLASS (gstd_session_parent_class)->finalize (object);
 }
 
 GstdSession *

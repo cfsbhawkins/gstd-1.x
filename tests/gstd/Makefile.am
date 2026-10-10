@@ -4,7 +4,8 @@ TESTS = test_gstd_pipeline_create 	\
 	test_gstd_stability		\
 	test_gstd_pipeline_limit	\
 	test_gstd_http		\
-	test_gstd_shutdown
+	test_gstd_shutdown	\
+	test_gstd_util_clamp
 
 check_PROGRAMS = $(TESTS)
 
