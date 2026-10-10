@@ -56,6 +56,35 @@ opt-in hardening on top of that:
   users cannot delete or replace each other's pid/socket/log files.
   Deployments with a dedicated gstd user should tighten this to 0750.
 
+## CPU clock floor (this fork)
+
+Some CPU frequency governors judge load per core and keep clocks low
+while a pipeline whose work is spread over several threads, or
+offloaded to hardware, falls behind real time. Setting
+`GSTD_PIPELINE_UTIL_CLAMP_MIN` to a value from 1 to 1024 gives gstd's
+threads that minimum utilization clamp while at least one pipeline
+exists. The clamp is raised when the first pipeline is created and
+released when the last one is deleted; threads started in between,
+such as streaming threads, inherit it. Threads already clamped higher,
+including real-time threads under the kernel's default boost, are left
+alone, and releasing only touches threads still at gstd's value.
+
+What the clamp does depends on the governor. `schedutil` and governors
+built on the same utilization signal raise the clock whenever a
+clamped thread runs: with `schedutil`, `512` asks for roughly 60% of
+the maximum clock and `1024` for all of it. Governors such as
+`ondemand`, `conservative` and `performance` ignore it. On a CPU with
+big and little cores, clamped threads may also be placed on the bigger
+cores. A sleeping thread is not affected, so while pipelines are idle
+the CPU still clocks down. A cgroup's `cpu.uclamp` limits can cap the
+effect, and before Linux 5.14 a container's `cpu.uclamp.min` (0 by
+default) could cancel it.
+
+It needs Linux 5.3 or later with utilization clamping
+(`CONFIG_UCLAMP_TASK`), and changing a clamp usually requires
+`CAP_SYS_NICE`. Without either, gstd logs one warning and runs
+unclamped. Unset by default.
+
 ## Shutdown (this fork)
 
 `SIGINT`/`SIGTERM` are received by a dedicated thread rather than a

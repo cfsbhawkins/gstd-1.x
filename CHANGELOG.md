@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workflow.
 
 ### Added
+- **CPU utilization clamp while pipelines exist** (`gstd_session.c`,
+  `gstd_util_clamp.c`). `GSTD_PIPELINE_UTIL_CLAMP_MIN` (1 to 1024)
+  raises the minimum utilization clamp of gstd's threads when the first
+  pipeline is created and releases it when the last is deleted, so a
+  governor that honors utilization clamps clocks up for a pipeline
+  whose load is spread thin. Threads clamped higher are left alone.
+  Needs a kernel with utilization clamping and usually `CAP_SYS_NICE`;
+  otherwise gstd warns once and runs unclamped. `GstdList` now notifies
+  `count` when children are added or removed.
 - **Opt-in HTTP API token authentication** (`gstd_http.c`)
   - `--http-api-token <token>` or `GSTD_HTTP_API_TOKEN` (preferred; command
     lines are visible to other local processes). When configured, every HTTP

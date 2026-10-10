@@ -58,6 +58,7 @@ gstd_src = [
   'gstd_socket.c',
   'gstd_unix.c',
   'gstd_log.c',
+  'gstd_util_clamp.c',
 ]
 
 libgstd_src = [
