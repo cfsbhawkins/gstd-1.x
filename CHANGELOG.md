@@ -58,6 +58,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at once.
 
 ### Fixed
+- **Utilization clamp ownership, retries and locking**
+  (`gstd_util_clamp.c`, `gstd_session.c`). Post-merge review of the clamp.
+  A raise that reached only some threads was recorded as complete, so the
+  next pipeline did not retry the rest. A failed release could clear the
+  session's record of the floor while threads still held it, and disposal
+  then skipped the release. The clamp now records whether gstd may hold
+  any thread separately from whether the last change reached every
+  thread: an incomplete one is retried at the next count change, and
+  disposal releases whenever gstd may hold a thread. A thread already at
+  gstd's value before the floor was raised was reset on release, since
+  equality was taken as ownership; such threads are now noted by tid and
+  start time and left alone, including one a racing listing only finds on
+  a later pass, provided it started before the raise. The pipeline count
+  is read under the list's lock. Replacing the session's pipeline list
+  moves the subscription to the new list, and unsetting it releases the
+  floor. A scan whose threads never settle reports `EAGAIN` instead of
+  success. A kernel without `CONFIG_UCLAMP_TASK`, which reports every
+  clamp as 0, is recognized as unsupported when every thread reads 0/0
+  and the `sched_util_clamp_min` sysctl is absent, so the warning appears
+  instead of a silent no-op; a single thread capped at 0 is skipped.
 - **Release the utilization clamp on threads that became real-time**
   (`gstd_util_clamp.c`). The release skipped every real-time thread, so a
   thread raised under normal scheduling that then switched to `SCHED_FIFO`

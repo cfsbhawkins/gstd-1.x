@@ -176,6 +176,7 @@
 #include "gstd_pipeline.h"
 #include "gstd_list.h"
 #include "gstd_debug.h"
+#include "gstd_util_clamp.h"
 
 G_BEGIN_DECLS
 #define GSTD_TYPE_SESSION \
@@ -219,9 +220,16 @@ struct _GstdSession
   guint util_clamp_min;
 
   /*
-   * Whether the clamp is currently applied
+   * The clamp and the threads it owns; NULL when off
    */
-  gboolean util_clamp_active;
+  GstdUtilClamp *util_clamp;
+
+  /*
+   * Whether the clamp was last asked to be up, and whether the threads
+   * got there. Until they do, every count change tries again.
+   */
+  gboolean util_clamp_raised;
+  gboolean util_clamp_settled;
 
   /*
    * Serializes clamp changes from concurrent pipeline creates and deletes

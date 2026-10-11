@@ -69,8 +69,9 @@ such as streaming threads, inherit it. Real-time and deadline threads
 are never written, so they keep the kernel's own boost; a thread that
 switches to a real-time policy while the floor is held keeps gstd's
 value until it is released. Threads already clamped higher, or whose
-maximum clamp is below the floor, are left alone, and releasing only
-touches threads still at gstd's value.
+maximum clamp is below the floor, are left alone. Releasing only
+touches threads still at gstd's value, and not those that already had
+it before the floor was raised.
 
 What the clamp does depends on the governor. `schedutil` and governors
 built on the same utilization signal raise the clock whenever a
@@ -87,7 +88,8 @@ It needs Linux 5.3 or later with utilization clamping
 (`CONFIG_UCLAMP_TASK`), and changing a clamp usually requires
 `CAP_SYS_NICE`. Without either, gstd logs one warning and runs
 unclamped. Any other failure is logged and retried the next time the
-pipeline count changes. Unset by default.
+pipeline count changes; a floor that was not fully released is released
+again when the session ends. Unset by default.
 
 ## Shutdown (this fork)
 
