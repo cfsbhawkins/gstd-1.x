@@ -66,9 +66,13 @@ gboolean gstd_util_clamp_parse (const gchar * str, guint * value);
 gint gstd_util_clamp_raise (guint value, guint * updated);
 
 /**
- * Returns every non-real-time thread whose minimum clamp is still exactly
- * \p value to the kernel default (0 before Linux 5.11), undoing
- * gstd_util_clamp_raise() without touching a clamp something else has set.
+ * Returns every thread whose minimum clamp is still exactly \p value to the
+ * kernel default, undoing gstd_util_clamp_raise() without touching a clamp
+ * something else has set. That includes a thread that switched to a
+ * real-time policy after the raise, unless \p value is the kernel's
+ * real-time default, which such a thread would have anyway. Before Linux
+ * 5.11, which has no reset, the default is written explicitly: 0, or the
+ * real-time default for a real-time thread.
  *
  * \param value The value gstd_util_clamp_raise() set
  * \param updated (out) (optional) How many threads were changed
@@ -105,6 +109,8 @@ typedef struct _GstdUtilClampBackend
 {
   gint (*get) (gint tid, GstdUtilClampThread * thread);
   gint (*set_min) (gint tid, guint util_min);
+  /* The minimum clamp the kernel gives real-time threads by default */
+  guint (*rt_default) (void);
 } GstdUtilClampBackend;
 
 /**

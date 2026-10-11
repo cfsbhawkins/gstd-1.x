@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at once.
 
 ### Fixed
+- **Release the utilization clamp on threads that became real-time**
+  (`gstd_util_clamp.c`). The release skipped every real-time thread, so a
+  thread raised under normal scheduling that then switched to `SCHED_FIFO`
+  or `SCHED_RR` kept gstd's value after the last pipeline, and kept it if
+  it later went back to normal scheduling. A real-time thread at exactly
+  gstd's value is now released to the kernel default, unless that value is
+  the real-time default (`kernel.sched_util_clamp_min_rt_default`) itself.
+  Before Linux 5.11 the default is written explicitly.
 - **Shutdown no longer depends on the main loop, and is bounded**
   (`gstd.c`). `SIGINT`/`SIGTERM` were GLib signal sources dispatched by the
   main loop. A pipeline whose state change never returns (a deadlocked
