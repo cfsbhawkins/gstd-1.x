@@ -45,6 +45,46 @@
  * up to this many times. */
 #define GSTD_UTIL_CLAMP_MAX_PASSES 8
 
+struct _GstdUtilClamp
+{
+  guint value;
+  /* Whether any thread may carry the value because of a raise */
+  gboolean held;
+  /* Threads that were at the value before the clamp was held, which a
+   * release must leave alone: tid to a guint64 start time, since the
+   * kernel reuses a tid once its thread exits */
+  GHashTable *preserved;
+};
+
+GstdUtilClamp *
+gstd_util_clamp_new (guint value)
+{
+  GstdUtilClamp *clamp;
+
+  g_return_val_if_fail (value >= 1 && value <= GSTD_UTIL_CLAMP_SCALE, NULL);
+
+  clamp = g_new0 (GstdUtilClamp, 1);
+  clamp->value = value;
+  clamp->preserved = g_hash_table_new_full (NULL, NULL, NULL, g_free);
+  return clamp;
+}
+
+void
+gstd_util_clamp_free (GstdUtilClamp * clamp)
+{
+  if (!clamp)
+    return;
+  g_hash_table_unref (clamp->preserved);
+  g_free (clamp);
+}
+
+gboolean
+gstd_util_clamp_is_held (GstdUtilClamp * clamp)
+{
+  g_return_val_if_fail (clamp, FALSE);
+  return clamp->held;
+}
+
 gboolean
 gstd_util_clamp_parse (const gchar * str, guint * value)
 {
@@ -133,12 +173,52 @@ gstd_util_clamp_kernel_get (gint tid, GstdUtilClampThread * thread)
   if (error != 0)
     return error;
 
+  /* Without CONFIG_UCLAMP_TASK the kernel reports both clamps as 0,
+   * which reads as a thread capped below any floor. A thread can be
+   * capped at 0 by hand, but only a kernel with clamping has the sysctl. */
+  if (attr.size >= sizeof (attr) && attr.sched_util_max == 0
+      && !g_file_test ("/proc/sys/kernel/sched_util_clamp_min",
+          G_FILE_TEST_EXISTS))
+    return EOPNOTSUPP;
+
   thread->policy = attr.sched_policy;
   thread->util_min = attr.sched_util_min;
   /* Before Linux 5.3 the kernel fills neither clamp */
   thread->util_max = attr.size >= sizeof (attr) ? attr.sched_util_max
       : GSTD_UTIL_CLAMP_SCALE;
   return 0;
+}
+
+/* Field 22 of /proc/self/task/<tid>/stat, in clock ticks since boot */
+static gint
+gstd_util_clamp_kernel_start_time (gint tid, guint64 * start)
+{
+  gchar *path = g_strdup_printf ("/proc/self/task/%d/stat", tid);
+  gchar *contents = NULL;
+  gchar *field;
+  gchar *end = NULL;
+  gint error = EINVAL;
+  guint i;
+
+  if (!g_file_get_contents (path, &contents, NULL, NULL)) {
+    g_free (path);
+    return ESRCH;
+  }
+  g_free (path);
+
+  /* The name, field 2, is in parentheses and may hold spaces and
+   * parentheses itself; the space before field 3 follows the last ')' */
+  field = strrchr (contents, ')');
+  for (i = 3; field && i <= 22; i++)
+    field = strchr (field + 1, ' ');
+
+  if (field) {
+    *start = g_ascii_strtoull (field + 1, &end, 10);
+    if (end != field + 1)
+      error = 0;
+  }
+  g_free (contents);
+  return error;
 }
 
 /* Changes only the minimum clamp: policy, priority, nice and the maximum
@@ -165,6 +245,7 @@ gstd_util_clamp_kernel_set_min (gint tid, guint util_min)
 static const GstdUtilClampBackend gstd_util_clamp_kernel = {
   gstd_util_clamp_kernel_get,
   gstd_util_clamp_kernel_set_min,
+  gstd_util_clamp_kernel_start_time,
   gstd_util_clamp_kernel_rt_default,
 };
 
@@ -189,10 +270,46 @@ gstd_util_clamp_is_realtime (guint policy)
   return policy == GSTD_SCHED_FIFO || policy == GSTD_SCHED_RR;
 }
 
+/* Notes that \p tid had the clamp's value before the clamp was held */
+static void
+gstd_util_clamp_preserve (GstdUtilClamp * clamp, gint tid)
+{
+  guint64 *start = g_new (guint64, 1);
+
+  /* Without a start time a reused tid could not be told apart, so the
+   * thread is treated as gstd's */
+  if (backend->start_time (tid, start) != 0) {
+    g_free (start);
+    return;
+  }
+  g_hash_table_insert (clamp->preserved, GINT_TO_POINTER (tid), start);
+}
+
+/* Whether \p tid is a thread that had the value before the clamp was held,
+ * and not a later thread the kernel gave the same id */
+static gboolean
+gstd_util_clamp_is_preserved (GstdUtilClamp * clamp, gint tid)
+{
+  guint64 *recorded =
+      g_hash_table_lookup (clamp->preserved, GINT_TO_POINTER (tid));
+  guint64 start = 0;
+
+  if (!recorded)
+    return FALSE;
+  if (backend->start_time (tid, &start) == 0 && start == *recorded)
+    return TRUE;
+  g_hash_table_remove (clamp->preserved, GINT_TO_POINTER (tid));
+  return FALSE;
+}
+
+/* \p record: this is the first look at the threads of a raise while the
+ * clamp is not held, so a thread at the value got it from elsewhere */
 static GstdUtilClampResult
-gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
+gstd_util_clamp_thread (GstdUtilClamp * clamp, gint tid, gboolean raise,
+    gboolean record, gint * error)
 {
   GstdUtilClampThread thread = { 0 };
+  guint value = clamp->value;
 
   *error = backend->get (tid, &thread);
   if (*error != 0)
@@ -200,6 +317,14 @@ gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
 
   /* Deadline threads are scheduled by bandwidth, not utilization */
   if (thread.policy == GSTD_SCHED_DEADLINE)
+    return GSTD_UTIL_CLAMP_SKIPPED;
+
+  if (raise && record && thread.util_min == value)
+    gstd_util_clamp_preserve (clamp, tid);
+
+  /* Equal, but not because of gstd */
+  if (!raise && thread.util_min == value
+      && gstd_util_clamp_is_preserved (clamp, tid))
     return GSTD_UTIL_CLAMP_SKIPPED;
 
   if (gstd_util_clamp_is_realtime (thread.policy)) {
@@ -236,6 +361,9 @@ gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
     if (thread.util_min >= value || thread.util_max < value)
       return GSTD_UTIL_CLAMP_SKIPPED;
     *error = backend->set_min (tid, value);
+    /* gstd's now, whatever it had before */
+    if (*error == 0)
+      g_hash_table_remove (clamp->preserved, GINT_TO_POINTER (tid));
   } else {
     /* Another clamp has replaced gstd's since */
     if (thread.util_min != value)
@@ -300,12 +428,18 @@ gstd_util_clamp_same_tids (GArray * a, GArray * b)
 }
 
 static gint
-gstd_util_clamp_all (guint value, gboolean raise, guint * updated)
+gstd_util_clamp_all (GstdUtilClamp * clamp, gboolean raise, guint * updated)
 {
   GArray *previous = NULL;
+  gboolean record = raise && !clamp->held;
+  gboolean stable = FALSE;
   gint error = 0;
   guint changed_total = 0;
   guint pass;
+
+  /* A fresh look: nothing carries gstd's value yet */
+  if (record)
+    g_hash_table_remove_all (clamp->preserved);
 
   for (pass = 0; pass < GSTD_UTIL_CLAMP_MAX_PASSES; pass++) {
     GArray *tids;
@@ -320,8 +454,10 @@ gstd_util_clamp_all (guint value, gboolean raise, guint * updated)
     for (i = 0; i < tids->len; i++) {
       gint thread_error = 0;
 
-      switch (gstd_util_clamp_thread (g_array_index (tids, gint, i), value,
-              raise, &thread_error)) {
+      /* Only the first pass: a thread listed later may have inherited
+       * the value from one this raise changed */
+      switch (gstd_util_clamp_thread (clamp, g_array_index (tids, gint, i),
+              raise, record && pass == 0, &thread_error)) {
         case GSTD_UTIL_CLAMP_CHANGED:
           changed++;
           break;
@@ -336,11 +472,15 @@ gstd_util_clamp_all (guint value, gboolean raise, guint * updated)
     }
 
     changed_total += changed;
+    if (raise && changed > 0)
+      clamp->held = TRUE;
+
     /* Done once a pass saw the same threads as the last one and had
      * nothing left to change. A pass that only failed again is no
      * progress either. */
     if (changed == 0 && gstd_util_clamp_same_tids (previous, tids)) {
       g_array_unref (tids);
+      stable = TRUE;
       break;
     }
     if (previous)
@@ -350,23 +490,39 @@ gstd_util_clamp_all (guint value, gboolean raise, guint * updated)
 
   if (previous)
     g_array_unref (previous);
+
+  /* Threads kept appearing or changing, so some may have been missed */
+  if (!stable && error == 0)
+    error = EAGAIN;
+
+  if (!raise && error == 0) {
+    clamp->held = FALSE;
+    g_hash_table_remove_all (clamp->preserved);
+  }
+
   if (updated)
     *updated = changed_total;
   return error;
 }
 
 gint
-gstd_util_clamp_raise (guint value, guint * updated)
+gstd_util_clamp_raise (GstdUtilClamp * clamp, guint * updated)
 {
-  g_return_val_if_fail (value >= 1 && value <= GSTD_UTIL_CLAMP_SCALE, EINVAL);
-  return gstd_util_clamp_all (value, TRUE, updated);
+  g_return_val_if_fail (clamp, EINVAL);
+  return gstd_util_clamp_all (clamp, TRUE, updated);
 }
 
 gint
-gstd_util_clamp_release (guint value, guint * updated)
+gstd_util_clamp_release (GstdUtilClamp * clamp, guint * updated)
 {
-  g_return_val_if_fail (value >= 1 && value <= GSTD_UTIL_CLAMP_SCALE, EINVAL);
-  return gstd_util_clamp_all (value, FALSE, updated);
+  g_return_val_if_fail (clamp, EINVAL);
+
+  if (!clamp->held) {
+    if (updated)
+      *updated = 0;
+    return 0;
+  }
+  return gstd_util_clamp_all (clamp, FALSE, updated);
 }
 
 #else
@@ -378,18 +534,18 @@ gstd_util_clamp_set_backend (const GstdUtilClampBackend * replacement)
 }
 
 gint
-gstd_util_clamp_raise (guint value, guint * updated)
+gstd_util_clamp_raise (GstdUtilClamp * clamp, guint * updated)
 {
-  (void) value;
+  (void) clamp;
   if (updated)
     *updated = 0;
   return ENOTSUP;
 }
 
 gint
-gstd_util_clamp_release (guint value, guint * updated)
+gstd_util_clamp_release (GstdUtilClamp * clamp, guint * updated)
 {
-  (void) value;
+  (void) clamp;
   if (updated)
     *updated = 0;
   return ENOTSUP;

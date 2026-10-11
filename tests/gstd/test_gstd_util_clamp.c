@@ -38,6 +38,9 @@
 #include <stdlib.h>
 
 #include "gstd_list.h"
+#include "gstd_list_reader.h"
+#include "gstd_pipeline_creator.h"
+#include "gstd_pipeline_deleter.h"
 #include "gstd_session.h"
 #include "gstd_util_clamp.h"
 
@@ -113,12 +116,14 @@ new_thread_util_min (void)
 static gboolean
 clamp_supported (void)
 {
+  GstdUtilClamp *clamp = gstd_util_clamp_new (512);
   guint updated = 0;
+  gboolean supported;
 
-  if (gstd_util_clamp_raise (512, &updated) != 0 || updated == 0)
-    return FALSE;
-  fail_unless_equals_int (0, gstd_util_clamp_release (512, NULL));
-  return TRUE;
+  supported = gstd_util_clamp_raise (clamp, &updated) == 0 && updated > 0;
+  fail_unless_equals_int (0, gstd_util_clamp_release (clamp, NULL));
+  gstd_util_clamp_free (clamp);
+  return supported;
 }
 
 static GstdObject *
@@ -379,6 +384,7 @@ GST_START_TEST (test_clamp_keeps_higher_clamps)
 {
   GstdObject *node;
   GstdSession *test_session;
+  GstdUtilClamp *other;
 
   if (!clamp_supported ()) {
     GST_INFO ("Utilization clamping unavailable; nothing to preserve");
@@ -386,7 +392,8 @@ GST_START_TEST (test_clamp_keeps_higher_clamps)
   }
 
   /* Something else asked for more than gstd will */
-  fail_unless_equals_int (0, gstd_util_clamp_raise (1024, NULL));
+  other = gstd_util_clamp_new (1024);
+  fail_unless_equals_int (0, gstd_util_clamp_raise (other, NULL));
 
   g_setenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN", "512", TRUE);
   test_session = gstd_session_new ("Higher_clamp_session");
@@ -403,7 +410,8 @@ GST_START_TEST (test_clamp_keeps_higher_clamps)
   gst_object_unref (test_session);
   fail_unless_equals_int (1024, current_util_min ());
 
-  fail_unless_equals_int (0, gstd_util_clamp_release (1024, NULL));
+  fail_unless_equals_int (0, gstd_util_clamp_release (other, NULL));
+  gstd_util_clamp_free (other);
   g_unsetenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN");
 }
 
@@ -621,6 +629,8 @@ typedef struct
 /* Up to two armed faults, matched in order */
 static FakeFault fake_faults[2];
 static gboolean fake_no_reset = FALSE;
+/* set_min reports success without changing anything */
+static gboolean fake_forget = FALSE;
 static guint fake_rt_default_value = GSTD_UTIL_CLAMP_SCALE;
 static guint fake_set_calls = 0;
 
@@ -632,6 +642,8 @@ typedef struct
 {
   GstdUtilClampThread state;
   gboolean user_defined;
+  /* Changes when the tid is given to a new thread */
+  guint64 start;
 } FakeThread;
 
 static FakeThread *
@@ -702,7 +714,7 @@ fake_set_min (gint tid, guint util_min)
   }
   if (error == 0 && util_min == GSTD_UTIL_CLAMP_RESET && fake_no_reset)
     error = EINVAL;
-  if (error == 0) {
+  if (error == 0 && !fake_forget) {
     FakeThread *thread = fake_entry (tid);
 
     /* A written value is user-defined; the reset clears that and gives
@@ -718,6 +730,15 @@ fake_set_min (gint tid, guint util_min)
   return error;
 }
 
+static gint
+fake_start_time (gint tid, guint64 * start)
+{
+  g_mutex_lock (&fake_mutex);
+  *start = fake_entry (tid)->start;
+  g_mutex_unlock (&fake_mutex);
+  return 0;
+}
+
 static guint
 fake_rt_default (void)
 {
@@ -725,7 +746,7 @@ fake_rt_default (void)
 }
 
 static const GstdUtilClampBackend fake_backend = {
-  fake_get, fake_set_min, fake_rt_default
+  fake_get, fake_set_min, fake_start_time, fake_rt_default
 };
 
 static gint
@@ -743,6 +764,34 @@ fake_util_min (gint tid)
   value = fake_thread (tid)->util_min;
   g_mutex_unlock (&fake_mutex);
   return value;
+}
+
+/* A clamp set by something other than gstd */
+static void
+fake_set_util_min (gint tid, guint util_min)
+{
+  FakeThread *thread;
+
+  g_mutex_lock (&fake_mutex);
+  thread = fake_entry (tid);
+  thread->state.util_min = util_min;
+  thread->user_defined = TRUE;
+  g_mutex_unlock (&fake_mutex);
+}
+
+/* The thread exits and the kernel gives its tid to a new thread, which
+ * inherits \p util_min from the thread that created it */
+static void
+fake_reuse_tid (gint tid, guint util_min)
+{
+  FakeThread *thread;
+
+  g_mutex_lock (&fake_mutex);
+  thread = fake_entry (tid);
+  thread->start++;
+  thread->state.util_min = util_min;
+  thread->user_defined = TRUE;
+  g_mutex_unlock (&fake_mutex);
 }
 
 static gboolean
@@ -801,6 +850,7 @@ fake_setup (void)
   fake_threads = g_hash_table_new_full (NULL, NULL, NULL, g_free);
   fake_arm (0, 0, 0, 0);
   fake_no_reset = FALSE;
+  fake_forget = FALSE;
   fake_rt_default_value = GSTD_UTIL_CLAMP_SCALE;
   fake_set_calls = 0;
   gstd_util_clamp_set_backend (&fake_backend);
@@ -831,7 +881,34 @@ fake_teardown (void)
   g_unsetenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN");
 }
 
-GST_START_TEST (test_fake_partial_release_restores_floor)
+GST_START_TEST (test_fake_partial_raise_retried)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_partial_raise_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  /* This thread refuses the raise; the parked one takes it */
+  fake_arm (own_tid (), 512, EBUSY, -1);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+
+  /* The next pipeline finishes the raise */
+  fake_arm (0, 0, 0, 0);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p1"));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_partial_release_retried)
 {
   GstdSession *test_session = gstd_session_new ("Fake_partial_session");
   GstdObject *node = pipelines_of (test_session);
@@ -844,9 +921,9 @@ GST_START_TEST (test_fake_partial_release_restores_floor)
   fake_arm (own_tid (), GSTD_UTIL_CLAMP_RESET, EBUSY, -1);
   fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
   fail_unless_equals_int (512, fake_util_min (own_tid ()));
-  /* Put back, so the next pipeline does not run with it down */
-  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
 
+  /* The next pipeline raises the floor again where it was released */
   fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
   fail_unless_equals_int (512, fake_util_min (parked_tid));
 
@@ -862,26 +939,135 @@ GST_START_TEST (test_fake_partial_release_restores_floor)
 
 GST_END_TEST;
 
-GST_START_TEST (test_fake_failed_restore_reraises_next_pipeline)
+GST_START_TEST (test_fake_dispose_after_failed_release)
 {
-  GstdSession *test_session = gstd_session_new ("Fake_restore_session");
+  GstdSession *test_session = gstd_session_new ("Fake_failed_release_session");
   GstdObject *node = pipelines_of (test_session);
 
   fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
 
-  /* The release fails on this thread after the parked one has gone, and
-   * putting the parked one back fails too */
+  /* The release reaches the parked thread but not this one */
   fake_arm (own_tid (), GSTD_UTIL_CLAMP_RESET, EBUSY, -1);
-  fake_arm_slot (1, parked_tid, 512, EBUSY, -1);
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  /* Disposing straight away must still take the floor down */
+  fake_arm (0, 0, 0, 0);
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_equal_clamp_preserved)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_equal_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  /* Something else already holds the parked thread at gstd's value */
+  fake_set_util_min (parked_tid, 512);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  /* Also after another round */
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_reused_tid_released)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_reused_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  fake_set_util_min (parked_tid, 512);
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+
+  /* The preserved thread exits; a thread gstd's clamp reached takes its
+   * tid */
+  fake_reuse_tid (parked_tid, 512);
   fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
   fail_unless_equals_int (0, fake_util_min (parked_tid));
 
-  /* Nothing fails any more: the next pipeline must raise the floor */
-  fake_arm (0, 0, 0, 0);
-  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_unsettled_scan_fails)
+{
+  GstdUtilClamp *clamp = gstd_util_clamp_new (512);
+
+  /* Every pass changes something, so no pass is clean */
+  fake_forget = TRUE;
+  fail_unless_equals_int (EAGAIN, gstd_util_clamp_raise (clamp, NULL));
+  fail_unless (gstd_util_clamp_is_held (clamp));
+
+  fake_forget = FALSE;
+  fail_unless_equals_int (0, gstd_util_clamp_release (clamp, NULL));
+  fail_if (gstd_util_clamp_is_held (clamp));
+  gstd_util_clamp_free (clamp);
+}
+
+GST_END_TEST;
+
+/* A list set up the way the session sets up its own */
+static GstdList *
+new_pipeline_list (void)
+{
+  GstdList *list =
+      GSTD_LIST (g_object_new (GSTD_TYPE_LIST, "name", "pipelines",
+          "node-type", GSTD_TYPE_PIPELINE, "flags",
+          GSTD_PARAM_CREATE | GSTD_PARAM_READ | GSTD_PARAM_UPDATE |
+          GSTD_PARAM_DELETE, NULL));
+
+  gstd_object_set_creator (GSTD_OBJECT (list),
+      g_object_new (GSTD_TYPE_PIPELINE_CREATOR, NULL));
+  gstd_object_set_reader (GSTD_OBJECT (list),
+      g_object_new (GSTD_TYPE_LIST_READER, NULL));
+  gstd_object_set_deleter (GSTD_OBJECT (list),
+      g_object_new (GSTD_TYPE_PIPELINE_DELETER, NULL));
+  return list;
+}
+
+GST_START_TEST (test_fake_replaced_list_followed)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_replaced_session");
+  GstdObject *old_list = pipelines_of (test_session);
+  GstdList *list = new_pipeline_list ();
+
+  /* The new list already has a pipeline: replacing raises the floor */
+  fail_if (GSTD_EOK != gstd_object_create (GSTD_OBJECT (list), "p0",
+          "fakesrc ! fakesink"));
+  g_object_set (test_session, "pipelines", list, NULL);
   fail_unless_equals_int (512, fake_util_min (parked_tid));
 
-  gst_object_unref (node);
+  /* The old list no longer counts */
+  fail_if (GSTD_EOK != gstd_object_create (old_list, "old",
+          "fakesrc ! fakesink"));
+  fail_if (GSTD_EOK != gstd_object_delete (GSTD_OBJECT (list), "p0"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  fail_if (GSTD_EOK != gstd_object_create (GSTD_OBJECT (list), "p1",
+          "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_if (GSTD_EOK != gstd_object_delete (GSTD_OBJECT (list), "p1"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (list);
+  gst_object_unref (old_list);
   gst_object_unref (test_session);
 }
 
@@ -1100,8 +1286,13 @@ gstd_util_clamp_suite (void)
     suite_add_tcase (suite, fake);
     tcase_set_timeout (fake, 30);
     tcase_add_checked_fixture (fake, fake_setup, fake_teardown);
-    tcase_add_test (fake, test_fake_partial_release_restores_floor);
-    tcase_add_test (fake, test_fake_failed_restore_reraises_next_pipeline);
+    tcase_add_test (fake, test_fake_partial_raise_retried);
+    tcase_add_test (fake, test_fake_partial_release_retried);
+    tcase_add_test (fake, test_fake_dispose_after_failed_release);
+    tcase_add_test (fake, test_fake_equal_clamp_preserved);
+    tcase_add_test (fake, test_fake_reused_tid_released);
+    tcase_add_test (fake, test_fake_unsettled_scan_fails);
+    tcase_add_test (fake, test_fake_replaced_list_followed);
     tcase_add_test (fake, test_fake_realtime_threads_untouched);
     tcase_add_test (fake, test_fake_promoted_thread_released);
     tcase_add_test (fake, test_fake_promoted_thread_released_without_reset);
