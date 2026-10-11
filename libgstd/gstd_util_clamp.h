@@ -139,18 +139,27 @@ typedef struct _GstdUtilClampThread
 } GstdUtilClampThread;
 
 /**
- * How the module reads and changes a thread. Each returns 0 or an errno.
- * set_min changes only the minimum clamp; \p util_min may be
- * GSTD_UTIL_CLAMP_RESET. start_time tells apart two threads that had the
- * same id at different times.
+ * How the module finds, reads and changes threads. Those returning gint
+ * return 0 or an errno.
  */
 typedef struct _GstdUtilClampBackend
 {
+  /* The ids of this process's threads, in any order, or NULL with
+   * \p error set */
+  GArray *(*list_threads) (gint * error);
   gint (*get) (gint tid, GstdUtilClampThread * thread);
+  /* Changes only the minimum clamp; \p util_min may be
+   * GSTD_UTIL_CLAMP_RESET */
   gint (*set_min) (gint tid, guint util_min);
+  /* Tells apart two threads that had the same id at different times */
   gint (*start_time) (gint tid, guint64 * start);
+  /* The time now, in start_time's units */
+  gint (*now) (guint64 * now);
   /* The minimum clamp the kernel gives real-time threads by default */
   guint (*rt_default) (void);
+  /* Whether the kernel can clamp at all, for when every thread reads as
+   * 0/0 */
+  gboolean (*has_clamping) (void);
 } GstdUtilClampBackend;
 
 /**

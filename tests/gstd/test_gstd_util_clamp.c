@@ -631,6 +631,16 @@ static FakeFault fake_faults[2];
 static gboolean fake_no_reset = FALSE;
 /* set_min reports success without changing anything */
 static gboolean fake_forget = FALSE;
+/* The maximum clamp a thread first seen gets; 0 models a kernel without
+ * CONFIG_UCLAMP_TASK */
+static guint fake_default_max = GSTD_UTIL_CLAMP_SCALE;
+/* Whether the kernel has the sched_util_clamp_min sysctl */
+static gboolean fake_sysctl = TRUE;
+/* The time now, in start time units; threads first seen started at 0 */
+static guint64 fake_clock = 100;
+/* A tid the next fake_hidden_lists listings leave out */
+static gint fake_hidden_tid = 0;
+static guint fake_hidden_lists = 0;
 static guint fake_rt_default_value = GSTD_UTIL_CLAMP_SCALE;
 static guint fake_set_calls = 0;
 
@@ -654,7 +664,7 @@ fake_entry (gint tid)
 
   if (!thread) {
     thread = g_new0 (FakeThread, 1);
-    thread->state.util_max = GSTD_UTIL_CLAMP_SCALE;
+    thread->state.util_max = fake_default_max;
     g_hash_table_insert (fake_threads, GINT_TO_POINTER (tid), thread);
   }
   return thread;
@@ -730,6 +740,53 @@ fake_set_min (gint tid, guint util_min)
   return error;
 }
 
+/* The real threads, less a hidden one, as a listing that raced with an
+ * exiting thread would miss it */
+static GArray *
+fake_list_threads (gint * error)
+{
+  GArray *tids = g_array_new (FALSE, FALSE, sizeof (gint));
+  GDir *dir = g_dir_open ("/proc/self/task", 0, NULL);
+  const gchar *name;
+  gboolean hide;
+
+  if (!dir) {
+    g_array_unref (tids);
+    *error = ENOENT;
+    return NULL;
+  }
+
+  g_mutex_lock (&fake_mutex);
+  hide = fake_hidden_lists > 0;
+  if (hide)
+    fake_hidden_lists--;
+  g_mutex_unlock (&fake_mutex);
+
+  while ((name = g_dir_read_name (dir)) != NULL) {
+    gint tid = atoi (name);
+
+    if (tid > 0 && !(hide && tid == fake_hidden_tid))
+      g_array_append_val (tids, tid);
+  }
+  g_dir_close (dir);
+  return tids;
+}
+
+static gint
+fake_now (guint64 * now)
+{
+  g_mutex_lock (&fake_mutex);
+  *now = fake_clock;
+  g_mutex_unlock (&fake_mutex);
+  return 0;
+}
+
+static gboolean
+fake_has_clamping (void)
+{
+  return fake_sysctl;
+}
+
 static gint
 fake_start_time (gint tid, guint64 * start)
 {
@@ -746,7 +803,8 @@ fake_rt_default (void)
 }
 
 static const GstdUtilClampBackend fake_backend = {
-  fake_get, fake_set_min, fake_start_time, fake_rt_default
+  fake_list_threads, fake_get, fake_set_min, fake_start_time, fake_now,
+  fake_rt_default, fake_has_clamping
 };
 
 static gint
@@ -788,9 +846,27 @@ fake_reuse_tid (gint tid, guint util_min)
 
   g_mutex_lock (&fake_mutex);
   thread = fake_entry (tid);
-  thread->start++;
+  thread->start = ++fake_clock;
   thread->state.util_min = util_min;
   thread->user_defined = TRUE;
+  g_mutex_unlock (&fake_mutex);
+}
+
+/* The next \p lists listings leave \p tid out */
+static void
+fake_hide (gint tid, guint lists)
+{
+  g_mutex_lock (&fake_mutex);
+  fake_hidden_tid = tid;
+  fake_hidden_lists = lists;
+  g_mutex_unlock (&fake_mutex);
+}
+
+static void
+fake_set_util_max (gint tid, guint util_max)
+{
+  g_mutex_lock (&fake_mutex);
+  fake_thread (tid)->util_max = util_max;
   g_mutex_unlock (&fake_mutex);
 }
 
@@ -851,6 +927,10 @@ fake_setup (void)
   fake_arm (0, 0, 0, 0);
   fake_no_reset = FALSE;
   fake_forget = FALSE;
+  fake_default_max = GSTD_UTIL_CLAMP_SCALE;
+  fake_sysctl = TRUE;
+  fake_clock = 100;
+  fake_hide (0, 0);
   fake_rt_default_value = GSTD_UTIL_CLAMP_SCALE;
   fake_set_calls = 0;
   gstd_util_clamp_set_backend (&fake_backend);
@@ -1054,10 +1134,12 @@ GST_START_TEST (test_fake_replaced_list_followed)
   g_object_set (test_session, "pipelines", list, NULL);
   fail_unless_equals_int (512, fake_util_min (parked_tid));
 
+  fail_if (GSTD_EOK != gstd_object_delete (GSTD_OBJECT (list), "p0"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
   /* The old list no longer counts */
   fail_if (GSTD_EOK != gstd_object_create (old_list, "old",
           "fakesrc ! fakesink"));
-  fail_if (GSTD_EOK != gstd_object_delete (GSTD_OBJECT (list), "p0"));
   fail_unless_equals_int (0, fake_util_min (parked_tid));
 
   fail_if (GSTD_EOK != gstd_object_create (GSTD_OBJECT (list), "p1",
@@ -1254,6 +1336,141 @@ GST_START_TEST (test_fake_dispose_retries_release)
 }
 
 GST_END_TEST;
+
+GST_START_TEST (test_fake_list_unset_releases)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_unset_session");
+  GstdObject *old_list = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (old_list, "p0",
+          "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  /* No list, no pipelines */
+  g_object_set (test_session, "pipelines", NULL, NULL);
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  /* Nor does the old one count */
+  fail_if (GSTD_EOK != gstd_object_create (old_list, "p1",
+          "fakesrc ! fakesink"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (old_list);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+/* A listing that misses a thread on the first pass, as one racing with an
+ * exiting sibling can, finds it on the next */
+GST_START_TEST (test_fake_late_listed_clamp_preserved)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_late_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  /* At gstd's value from elsewhere, long before the raise */
+  fake_set_util_min (parked_tid, 512);
+  fake_hide (parked_tid, 1);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (own_tid ()));
+
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_late_listed_new_thread_released)
+{
+  GstdSession *test_session = gstd_session_new ("Fake_late_new_session");
+  GstdObject *node = pipelines_of (test_session);
+
+  /* Started after the raise began, from a thread it had already raised */
+  fake_reuse_tid (parked_tid, 512);
+  g_mutex_lock (&fake_mutex);
+  fake_clock = 0;
+  g_mutex_unlock (&fake_mutex);
+  fake_hide (parked_tid, 1);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_no_clamping_disables)
+{
+  GstdSession *test_session;
+  GstdObject *node;
+
+  /* Every thread reads 0/0 and there is no sysctl */
+  fake_default_max = 0;
+  fake_sysctl = FALSE;
+  test_session = gstd_session_new ("Fake_no_clamping_session");
+  node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (0, fake_set_calls);
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+
+  /* Given up for the session: even threads that could now be clamped
+   * are not asked */
+  fake_set_util_max (parked_tid, GSTD_UTIL_CLAMP_SCALE);
+  fake_set_util_max (own_tid (), GSTD_UTIL_CLAMP_SCALE);
+  fake_sysctl = TRUE;
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (0, fake_set_calls);
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_zero_max_thread_skipped)
+{
+  GstdSession *test_session;
+  GstdObject *node;
+  guint calls;
+
+  /* One thread capped at 0 on purpose; the sysctl is not visible here,
+   * as in a mount namespace without it */
+  fake_set_util_max (own_tid (), 0);
+  fake_sysctl = FALSE;
+  test_session = gstd_session_new ("Fake_zero_max_session");
+  node = pipelines_of (test_session);
+
+  fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_unless_equals_int (0, fake_util_min (own_tid ()));
+
+  /* Settled: another pipeline does not scan again */
+  calls = fake_set_calls;
+  fail_if (GSTD_EOK != gstd_object_create (node, "p1", "fakesrc ! fakesink"));
+  fail_unless_equals_int (calls, fake_set_calls);
+
+  /* And not disabled: the floor comes back after a release */
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
+  fail_if (GSTD_EOK != gstd_object_delete (node, "p1"));
+  fail_unless_equals_int (0, fake_util_min (parked_tid));
+  fail_if (GSTD_EOK != gstd_object_create (node, "p2", "fakesrc ! fakesink"));
+  fail_unless_equals_int (512, fake_util_min (parked_tid));
+
+  gst_object_unref (node);
+  gst_object_unref (test_session);
+}
+
+GST_END_TEST;
 #endif
 
 static Suite *
@@ -1293,6 +1510,11 @@ gstd_util_clamp_suite (void)
     tcase_add_test (fake, test_fake_reused_tid_released);
     tcase_add_test (fake, test_fake_unsettled_scan_fails);
     tcase_add_test (fake, test_fake_replaced_list_followed);
+    tcase_add_test (fake, test_fake_list_unset_releases);
+    tcase_add_test (fake, test_fake_late_listed_clamp_preserved);
+    tcase_add_test (fake, test_fake_late_listed_new_thread_released);
+    tcase_add_test (fake, test_fake_no_clamping_disables);
+    tcase_add_test (fake, test_fake_zero_max_thread_skipped);
     tcase_add_test (fake, test_fake_realtime_threads_untouched);
     tcase_add_test (fake, test_fake_promoted_thread_released);
     tcase_add_test (fake, test_fake_promoted_thread_released_without_reset);

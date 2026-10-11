@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <stdint.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -173,14 +174,6 @@ gstd_util_clamp_kernel_get (gint tid, GstdUtilClampThread * thread)
   if (error != 0)
     return error;
 
-  /* Without CONFIG_UCLAMP_TASK the kernel reports both clamps as 0,
-   * which reads as a thread capped below any floor. A thread can be
-   * capped at 0 by hand, but only a kernel with clamping has the sysctl. */
-  if (attr.size >= sizeof (attr) && attr.sched_util_max == 0
-      && !g_file_test ("/proc/sys/kernel/sched_util_clamp_min",
-          G_FILE_TEST_EXISTS))
-    return EOPNOTSUPP;
-
   thread->policy = attr.sched_policy;
   thread->util_min = attr.sched_util_min;
   /* Before Linux 5.3 the kernel fills neither clamp */
@@ -221,6 +214,64 @@ gstd_util_clamp_kernel_start_time (gint tid, guint64 * start)
   return error;
 }
 
+/* The time now, in the units of gstd_util_clamp_kernel_start_time: the
+ * kernel derives both from the boot clock */
+static gint
+gstd_util_clamp_kernel_now (guint64 * now)
+{
+  struct timespec ts;
+  glong hz = sysconf (_SC_CLK_TCK);
+
+  if (hz <= 0 || hz > 1000000000)
+    return EINVAL;
+  if (clock_gettime (CLOCK_BOOTTIME, &ts) != 0)
+    return errno;
+  /* The kernel's own conversion, so the two agree on tick boundaries */
+  *now = ((guint64) ts.tv_sec * 1000000000 + (guint64) ts.tv_nsec)
+      / (guint64) (1000000000 / hz);
+  return 0;
+}
+
+/* Only a kernel built with CONFIG_UCLAMP_TASK has the sysctl */
+static gboolean
+gstd_util_clamp_kernel_has_clamping (void)
+{
+  return g_file_test ("/proc/sys/kernel/sched_util_clamp_min",
+      G_FILE_TEST_EXISTS);
+}
+
+/* The ids of this process's threads, or NULL with \p error set */
+static GArray *
+gstd_util_clamp_kernel_list_threads (gint * error)
+{
+  GArray *tids;
+  DIR *tasks;
+  struct dirent *entry;
+
+  tasks = opendir ("/proc/self/task");
+  if (!tasks) {
+    *error = errno;
+    return NULL;
+  }
+
+  tids = g_array_new (FALSE, FALSE, sizeof (gint));
+  while ((entry = readdir (tasks)) != NULL) {
+    gchar *end = NULL;
+    guint64 tid;
+    gint value;
+
+    if (!g_ascii_isdigit (entry->d_name[0]))
+      continue;
+    tid = g_ascii_strtoull (entry->d_name, &end, 10);
+    if (!end || *end != '\0' || tid == 0 || tid > G_MAXINT)
+      continue;
+    value = (gint) tid;
+    g_array_append_val (tids, value);
+  }
+  closedir (tasks);
+  return tids;
+}
+
 /* Changes only the minimum clamp: policy, priority, nice and the maximum
  * clamp are kept as they are. */
 static gint
@@ -243,10 +294,13 @@ gstd_util_clamp_kernel_set_min (gint tid, guint util_min)
 }
 
 static const GstdUtilClampBackend gstd_util_clamp_kernel = {
+  gstd_util_clamp_kernel_list_threads,
   gstd_util_clamp_kernel_get,
   gstd_util_clamp_kernel_set_min,
   gstd_util_clamp_kernel_start_time,
+  gstd_util_clamp_kernel_now,
   gstd_util_clamp_kernel_rt_default,
+  gstd_util_clamp_kernel_has_clamping,
 };
 
 static const GstdUtilClampBackend *backend = &gstd_util_clamp_kernel;
@@ -270,19 +324,48 @@ gstd_util_clamp_is_realtime (guint policy)
   return policy == GSTD_SCHED_FIFO || policy == GSTD_SCHED_RR;
 }
 
-/* Notes that \p tid had the clamp's value before the clamp was held */
-static void
-gstd_util_clamp_preserve (GstdUtilClamp * clamp, gint tid)
+/* One raise or release, across all of its passes */
+typedef struct
 {
-  guint64 *start = g_new (guint64, 1);
+  GstdUtilClamp *clamp;
+  gboolean raise;
+  /* A raise while the clamp is not held: no thread has gstd's value from
+   * gstd yet, so one at the value got it from elsewhere */
+  gboolean record;
+  /* When the scan began, in start time units; a thread started later may
+   * have inherited the value from one this scan changed */
+  gboolean have_started;
+  guint64 started;
+  /* The tids this scan changed */
+  GHashTable *changed;
+  /* Whether any thread was read, and whether any reported a clamp */
+  gboolean seen_thread;
+  gboolean seen_clamp;
+  guint pass;
+} GstdUtilClampScan;
 
+/* Notes that \p tid had the clamp's value before the clamp was held. On
+ * the first pass every listed thread predates the scan's changes; a
+ * thread first listed later counts only if it started before the scan. */
+static void
+gstd_util_clamp_preserve (GstdUtilClampScan * scan, gint tid)
+{
+  guint64 *start;
+
+  /* gstd's own, from an earlier pass */
+  if (g_hash_table_contains (scan->changed, GINT_TO_POINTER (tid)))
+    return;
+
+  start = g_new (guint64, 1);
   /* Without a start time a reused tid could not be told apart, so the
    * thread is treated as gstd's */
-  if (backend->start_time (tid, start) != 0) {
+  if (backend->start_time (tid, start) != 0
+      || (scan->pass > 0 && (!scan->have_started
+              || *start >= scan->started))) {
     g_free (start);
     return;
   }
-  g_hash_table_insert (clamp->preserved, GINT_TO_POINTER (tid), start);
+  g_hash_table_insert (scan->clamp->preserved, GINT_TO_POINTER (tid), start);
 }
 
 /* Whether \p tid is a thread that had the value before the clamp was held,
@@ -302,25 +385,28 @@ gstd_util_clamp_is_preserved (GstdUtilClamp * clamp, gint tid)
   return FALSE;
 }
 
-/* \p record: this is the first look at the threads of a raise while the
- * clamp is not held, so a thread at the value got it from elsewhere */
 static GstdUtilClampResult
-gstd_util_clamp_thread (GstdUtilClamp * clamp, gint tid, gboolean raise,
-    gboolean record, gint * error)
+gstd_util_clamp_thread (GstdUtilClampScan * scan, gint tid, gint * error)
 {
   GstdUtilClampThread thread = { 0 };
+  GstdUtilClamp *clamp = scan->clamp;
   guint value = clamp->value;
+  gboolean raise = scan->raise;
 
   *error = backend->get (tid, &thread);
   if (*error != 0)
     return GSTD_UTIL_CLAMP_FAILED;
 
+  scan->seen_thread = TRUE;
+  if (thread.util_min != 0 || thread.util_max != 0)
+    scan->seen_clamp = TRUE;
+
   /* Deadline threads are scheduled by bandwidth, not utilization */
   if (thread.policy == GSTD_SCHED_DEADLINE)
     return GSTD_UTIL_CLAMP_SKIPPED;
 
-  if (raise && record && thread.util_min == value)
-    gstd_util_clamp_preserve (clamp, tid);
+  if (raise && scan->record && thread.util_min == value)
+    gstd_util_clamp_preserve (scan, tid);
 
   /* Equal, but not because of gstd */
   if (!raise && thread.util_min == value
@@ -357,13 +443,16 @@ gstd_util_clamp_thread (GstdUtilClamp * clamp, gint tid, gboolean raise,
       *error = backend->set_min (tid, rt_default);
     }
   } else if (raise) {
-    /* Already enough, or capped below the floor by its maximum clamp */
+    /* Already enough, or capped below the floor by its maximum clamp,
+     * possibly at 0 */
     if (thread.util_min >= value || thread.util_max < value)
       return GSTD_UTIL_CLAMP_SKIPPED;
     *error = backend->set_min (tid, value);
     /* gstd's now, whatever it had before */
-    if (*error == 0)
+    if (*error == 0) {
+      g_hash_table_add (scan->changed, GINT_TO_POINTER (tid));
       g_hash_table_remove (clamp->preserved, GINT_TO_POINTER (tid));
+    }
   } else {
     /* Another clamp has replaced gstd's since */
     if (thread.util_min != value)
@@ -390,33 +479,10 @@ gstd_util_clamp_compare_tids (gconstpointer a, gconstpointer b)
 static GArray *
 gstd_util_clamp_list_threads (gint * error)
 {
-  GArray *tids;
-  DIR *tasks;
-  struct dirent *entry;
+  GArray *tids = backend->list_threads (error);
 
-  tasks = opendir ("/proc/self/task");
-  if (!tasks) {
-    *error = errno;
-    return NULL;
-  }
-
-  tids = g_array_new (FALSE, FALSE, sizeof (gint));
-  while ((entry = readdir (tasks)) != NULL) {
-    gchar *end = NULL;
-    guint64 tid;
-    gint value;
-
-    if (!g_ascii_isdigit (entry->d_name[0]))
-      continue;
-    tid = g_ascii_strtoull (entry->d_name, &end, 10);
-    if (!end || *end != '\0' || tid == 0 || tid > G_MAXINT)
-      continue;
-    value = (gint) tid;
-    g_array_append_val (tids, value);
-  }
-  closedir (tasks);
-
-  g_array_sort (tids, gstd_util_clamp_compare_tids);
+  if (tids)
+    g_array_sort (tids, gstd_util_clamp_compare_tids);
   return tids;
 }
 
@@ -430,16 +496,24 @@ gstd_util_clamp_same_tids (GArray * a, GArray * b)
 static gint
 gstd_util_clamp_all (GstdUtilClamp * clamp, gboolean raise, guint * updated)
 {
+  GstdUtilClampScan scan = { 0 };
   GArray *previous = NULL;
-  gboolean record = raise && !clamp->held;
   gboolean stable = FALSE;
   gint error = 0;
   guint changed_total = 0;
   guint pass;
 
-  /* A fresh look: nothing carries gstd's value yet */
-  if (record)
+  scan.clamp = clamp;
+  scan.raise = raise;
+  scan.record = raise && !clamp->held;
+  scan.changed = g_hash_table_new (NULL, NULL);
+
+  /* A fresh look: nothing carries gstd's value yet. Once the clamp is
+   * held, the threads noted then are kept until a complete release. */
+  if (scan.record) {
     g_hash_table_remove_all (clamp->preserved);
+    scan.have_started = backend->now (&scan.started) == 0;
+  }
 
   for (pass = 0; pass < GSTD_UTIL_CLAMP_MAX_PASSES; pass++) {
     GArray *tids;
@@ -454,10 +528,9 @@ gstd_util_clamp_all (GstdUtilClamp * clamp, gboolean raise, guint * updated)
     for (i = 0; i < tids->len; i++) {
       gint thread_error = 0;
 
-      /* Only the first pass: a thread listed later may have inherited
-       * the value from one this raise changed */
-      switch (gstd_util_clamp_thread (clamp, g_array_index (tids, gint, i),
-              raise, record && pass == 0, &thread_error)) {
+      scan.pass = pass;
+      switch (gstd_util_clamp_thread (&scan, g_array_index (tids, gint, i),
+              &thread_error)) {
         case GSTD_UTIL_CLAMP_CHANGED:
           changed++;
           break;
@@ -490,6 +563,15 @@ gstd_util_clamp_all (GstdUtilClamp * clamp, gboolean raise, guint * updated)
 
   if (previous)
     g_array_unref (previous);
+  g_hash_table_unref (scan.changed);
+
+  /* A kernel without CONFIG_UCLAMP_TASK reports every clamp as 0, which
+   * reads as threads capped below any floor, so nothing was changed. A
+   * single thread capped at 0 by hand is no reason to give up, and a
+   * kernel with clamping reports at least the default maximum on others. */
+  if (raise && changed_total == 0 && scan.seen_thread && !scan.seen_clamp
+      && !backend->has_clamping ())
+    error = EOPNOTSUPP;
 
   /* Threads kept appearing or changing, so some may have been missed */
   if (!stable && error == 0)

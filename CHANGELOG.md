@@ -69,12 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disposal releases whenever gstd may hold a thread. A thread already at
   gstd's value before the floor was raised was reset on release, since
   equality was taken as ownership; such threads are now noted by tid and
-  start time and left alone. The pipeline count is read under the list's
-  lock. Replacing the session's pipeline list moves the subscription to
-  the new list. A scan whose threads never settle reports `EAGAIN`
-  instead of success. A kernel without `CONFIG_UCLAMP_TASK`, which
-  reports every clamp as 0, is recognized as unsupported, so the warning
-  appears instead of a silent no-op.
+  start time and left alone, including one a racing listing only finds on
+  a later pass, provided it started before the raise. The pipeline count
+  is read under the list's lock. Replacing the session's pipeline list
+  moves the subscription to the new list, and unsetting it releases the
+  floor. A scan whose threads never settle reports `EAGAIN` instead of
+  success. A kernel without `CONFIG_UCLAMP_TASK`, which reports every
+  clamp as 0, is recognized as unsupported when every thread reads 0/0
+  and the `sched_util_clamp_min` sysctl is absent, so the warning appears
+  instead of a silent no-op; a single thread capped at 0 is skipped.
 - **Release the utilization clamp on threads that became real-time**
   (`gstd_util_clamp.c`). The release skipped every real-time thread, so a
   thread raised under normal scheduling that then switched to `SCHED_FIFO`
