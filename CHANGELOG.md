@@ -63,9 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thread raised under normal scheduling that then switched to `SCHED_FIFO`
   or `SCHED_RR` kept gstd's value after the last pipeline, and kept it if
   it later went back to normal scheduling. A real-time thread at exactly
-  gstd's value is now released to the kernel default, unless that value is
-  the real-time default (`kernel.sched_util_clamp_min_rt_default`) itself.
-  Before Linux 5.11 the default is written explicitly.
+  gstd's value is now reset, which clears the user-defined clamp, so it
+  drops to 0 if it leaves real-time. Before Linux 5.11, which has no
+  reset, the real-time default is written explicitly instead, except when
+  gstd's value is that default, where the write would pin a thread that
+  only had the kernel's boost.
 - **Shutdown no longer depends on the main loop, and is bounded**
   (`gstd.c`). `SIGINT`/`SIGTERM` were GLib signal sources dispatched by the
   main loop. A pipeline whose state change never returns (a deadlocked

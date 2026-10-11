@@ -210,18 +210,27 @@ gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
     if (raise)
       return GSTD_UTIL_CLAMP_SKIPPED;
 
-    /* A real-time thread at exactly gstd's value, when that is not the
-     * real-time default, was clamped before it switched policy and must
-     * be released too. At the default it is what the thread would have
-     * anyway, and could be the kernel's own. */
-    rt_default = backend->rt_default ();
-    if (thread.util_min != value || value == rt_default)
+    /* A real-time thread at exactly gstd's value was clamped before it
+     * switched policy, or holds the kernel's own boost when that value is
+     * the real-time default. The reset is right for both: it clears the
+     * user-defined flag, so a thread that later leaves real-time drops to
+     * 0 instead of keeping gstd's floor. */
+    if (thread.util_min != value)
       return GSTD_UTIL_CLAMP_SKIPPED;
 
     *error = backend->set_min (tid, GSTD_UTIL_CLAMP_RESET);
-    /* Before Linux 5.11 there is no reset: write the default explicitly */
-    if (*error == EINVAL)
+    if (*error == EINVAL) {
+      /* Before Linux 5.11 there is no reset, and writing the number sets
+       * the flag. At the real-time default that would pin a thread that
+       * merely had the kernel's boost, so leave it; otherwise write the
+       * default explicitly. */
+      rt_default = backend->rt_default ();
+      if (value == rt_default) {
+        *error = 0;
+        return GSTD_UTIL_CLAMP_SKIPPED;
+      }
       *error = backend->set_min (tid, rt_default);
+    }
   } else if (raise) {
     /* Already enough, or capped below the floor by its maximum clamp */
     if (thread.util_min >= value || thread.util_max < value)

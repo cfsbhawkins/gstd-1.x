@@ -417,6 +417,8 @@ typedef struct
   gint tid;
   gboolean promote;
   gint promoted;
+  gboolean demote;
+  gint demoted;
   gboolean finish;
 } PromotedThread;
 
@@ -440,6 +442,15 @@ promoted_thread (gpointer data)
         &param) == 0 ? 1 : -1;
   }
   g_cond_broadcast (&job->cond);
+  while (!job->demote)
+    g_cond_wait (&job->cond, &job->mutex);
+  {
+    struct sched_param param = { 0 };
+
+    job->demoted = pthread_setschedparam (pthread_self (), SCHED_OTHER,
+        &param) == 0 ? 1 : -1;
+  }
+  g_cond_broadcast (&job->cond);
   while (!job->finish)
     g_cond_wait (&job->cond, &job->mutex);
   g_mutex_unlock (&job->mutex);
@@ -447,8 +458,8 @@ promoted_thread (gpointer data)
 }
 
 /* On a real kernel: a thread raised under normal scheduling that switches
- * to SCHED_FIFO keeps the clamp, and the release returns it to the kernel's
- * real-time default */
+ * to SCHED_FIFO keeps the clamp; the release returns it to the kernel's
+ * real-time default, and to 0 once it is back on SCHED_OTHER */
 GST_START_TEST (test_clamp_released_after_promotion)
 {
   GstdObject *node;
@@ -466,10 +477,6 @@ GST_START_TEST (test_clamp_released_after_promotion)
           &contents, NULL, NULL))
     rt_default = atoi (contents);
   g_free (contents);
-  if (rt_default == 512) {
-    GST_INFO ("The real-time default is gstd's value; nothing to tell apart");
-    return;
-  }
 
   g_mutex_init (&job.mutex);
   g_cond_init (&job.cond);
@@ -497,12 +504,23 @@ GST_START_TEST (test_clamp_released_after_promotion)
     fail_unless_equals_int (512, util_min_of (job.tid));
     fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
     fail_unless_equals_int (rt_default, util_min_of (job.tid));
+
+    /* Released, not overwritten: back on SCHED_OTHER it has no floor */
+    g_mutex_lock (&job.mutex);
+    job.demote = TRUE;
+    g_cond_broadcast (&job.cond);
+    while (job.demoted == 0)
+      g_cond_wait (&job.cond, &job.mutex);
+    g_mutex_unlock (&job.mutex);
+    fail_unless_equals_int (1, job.demoted);
+    fail_unless_equals_int (0, util_min_of (job.tid));
   } else {
     GST_INFO ("Cannot switch to SCHED_FIFO here; promotion not tested");
     fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
   }
 
   g_mutex_lock (&job.mutex);
+  job.demote = TRUE;
   job.finish = TRUE;
   g_cond_broadcast (&job.cond);
   g_mutex_unlock (&job.mutex);
@@ -606,18 +624,50 @@ static gboolean fake_no_reset = FALSE;
 static guint fake_rt_default_value = GSTD_UTIL_CLAMP_SCALE;
 static guint fake_set_calls = 0;
 
-static GstdUtilClampThread *
-fake_thread (gint tid)
+#define FAKE_SCHED_OTHER 0
+
+/* A thread as the kernel keeps it: the requested clamp, and whether it
+ * was set by hand (user-defined) or is the default for the policy */
+typedef struct
 {
-  GstdUtilClampThread *thread =
+  GstdUtilClampThread state;
+  gboolean user_defined;
+} FakeThread;
+
+static FakeThread *
+fake_entry (gint tid)
+{
+  FakeThread *thread =
       g_hash_table_lookup (fake_threads, GINT_TO_POINTER (tid));
 
   if (!thread) {
-    thread = g_new0 (GstdUtilClampThread, 1);
-    thread->util_max = GSTD_UTIL_CLAMP_SCALE;
+    thread = g_new0 (FakeThread, 1);
+    thread->state.util_max = GSTD_UTIL_CLAMP_SCALE;
     g_hash_table_insert (fake_threads, GINT_TO_POINTER (tid), thread);
   }
   return thread;
+}
+
+static GstdUtilClampThread *
+fake_thread (gint tid)
+{
+  return &fake_entry (tid)->state;
+}
+
+/* What sched_setscheduler() does to the clamp: a user-defined one is kept
+ * across the change, a default one becomes the new policy's default */
+static void
+fake_set_policy (gint tid, guint policy)
+{
+  FakeThread *thread;
+
+  g_mutex_lock (&fake_mutex);
+  thread = fake_entry (tid);
+  thread->state.policy = policy;
+  if (!thread->user_defined)
+    thread->state.util_min = policy == FAKE_SCHED_FIFO
+        ? fake_rt_default_value : 0;
+  g_mutex_unlock (&fake_mutex);
 }
 
 static gint
@@ -653,13 +703,15 @@ fake_set_min (gint tid, guint util_min)
   if (error == 0 && util_min == GSTD_UTIL_CLAMP_RESET && fake_no_reset)
     error = EINVAL;
   if (error == 0) {
-    GstdUtilClampThread *thread = fake_thread (tid);
+    FakeThread *thread = fake_entry (tid);
 
-    /* The reset gives a real-time thread the kernel's real-time default */
-    if (util_min != GSTD_UTIL_CLAMP_RESET)
-      thread->util_min = util_min;
+    /* A written value is user-defined; the reset clears that and gives
+     * the policy's default */
+    thread->user_defined = util_min != GSTD_UTIL_CLAMP_RESET;
+    if (thread->user_defined)
+      thread->state.util_min = util_min;
     else
-      thread->util_min = thread->policy == FAKE_SCHED_FIFO
+      thread->state.util_min = thread->state.policy == FAKE_SCHED_FIFO
           ? fake_rt_default_value : 0;
   }
   g_mutex_unlock (&fake_mutex);
@@ -691,6 +743,17 @@ fake_util_min (gint tid)
   value = fake_thread (tid)->util_min;
   g_mutex_unlock (&fake_mutex);
   return value;
+}
+
+static gboolean
+fake_user_defined (gint tid)
+{
+  gboolean user_defined;
+
+  g_mutex_lock (&fake_mutex);
+  user_defined = fake_entry (tid)->user_defined;
+  g_mutex_unlock (&fake_mutex);
+  return user_defined;
 }
 
 static void
@@ -832,10 +895,7 @@ GST_START_TEST (test_fake_realtime_threads_untouched)
 
   /* A real-time thread under the kernel's default boost, and a kernel
    * without the reset value (before 5.11) */
-  g_mutex_lock (&fake_mutex);
-  fake_thread (own_tid ())->policy = FAKE_SCHED_FIFO;
-  fake_thread (own_tid ())->util_min = 1024;
-  g_mutex_unlock (&fake_mutex);
+  fake_set_policy (own_tid (), FAKE_SCHED_FIFO);
   fake_no_reset = TRUE;
   g_setenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN", "1024", TRUE);
 
@@ -855,35 +915,44 @@ GST_START_TEST (test_fake_realtime_threads_untouched)
   gst_object_unref (node);
   gst_object_unref (test_session);
   fail_unless_equals_int (1024, fake_util_min (own_tid ()));
+  /* Still the kernel's boost, not a pinned value it would keep after
+   * leaving real-time */
+  fail_if (fake_user_defined (own_tid ()));
 }
 
 GST_END_TEST;
 
 /* A thread raised under normal scheduling that then switches to a
- * real-time policy keeps gstd's value; the release must still take it
- * back, to the real-time default, on kernels with and without the reset */
+ * real-time policy keeps gstd's value. The release must take it back, so
+ * that the thread drops to 0 when it leaves real-time again; before 5.11
+ * the explicit write keeps the real-time default instead. */
 static void
-check_promoted_thread_released (gboolean no_reset)
+check_promoted_thread_released (const gchar * value, guint rt_default,
+    gboolean no_reset, guint after_demotion)
 {
   GstdSession *test_session;
   GstdObject *node;
+  guint raised = (guint) atoi (value);
 
   fake_no_reset = no_reset;
+  fake_rt_default_value = rt_default;
+  g_setenv ("GSTD_PIPELINE_UTIL_CLAMP_MIN", value, TRUE);
   test_session = gstd_session_new ("Fake_promoted_session");
   node = pipelines_of (test_session);
 
   fail_if (GSTD_EOK != gstd_object_create (node, "p0", "fakesrc ! fakesink"));
-  fail_unless_equals_int (512, fake_util_min (parked_tid));
+  fail_unless_equals_int (raised, fake_util_min (parked_tid));
 
-  /* What sched_setscheduler(SCHED_FIFO) leaves behind: the policy changes,
-   * the user-defined clamp stays */
-  g_mutex_lock (&fake_mutex);
-  fake_thread (parked_tid)->policy = FAKE_SCHED_FIFO;
-  g_mutex_unlock (&fake_mutex);
+  /* The policy changes; the user-defined clamp stays */
+  fake_set_policy (parked_tid, FAKE_SCHED_FIFO);
+  fail_unless_equals_int (raised, fake_util_min (parked_tid));
 
   fail_if (GSTD_EOK != gstd_object_delete (node, "p0"));
-  fail_unless_equals_int (1024, fake_util_min (parked_tid));
+  fail_unless_equals_int (rt_default, fake_util_min (parked_tid));
   fail_unless_equals_int (0, fake_util_min (own_tid ()));
+
+  fake_set_policy (parked_tid, FAKE_SCHED_OTHER);
+  fail_unless_equals_int (after_demotion, fake_util_min (parked_tid));
 
   gst_object_unref (node);
   gst_object_unref (test_session);
@@ -891,14 +960,24 @@ check_promoted_thread_released (gboolean no_reset)
 
 GST_START_TEST (test_fake_promoted_thread_released)
 {
-  check_promoted_thread_released (FALSE);
+  check_promoted_thread_released ("512", 1024, FALSE, 0);
 }
 
 GST_END_TEST;
 
 GST_START_TEST (test_fake_promoted_thread_released_without_reset)
 {
-  check_promoted_thread_released (TRUE);
+  /* Without the reset the number is written, and outlives the policy */
+  check_promoted_thread_released ("512", 1024, TRUE, 1024);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_fake_promoted_thread_released_at_rt_default)
+{
+  /* gstd's value is the real-time default: indistinguishable while the
+   * thread is real-time, but it must still lose the floor when it leaves */
+  check_promoted_thread_released ("1024", 1024, FALSE, 0);
 }
 
 GST_END_TEST;
@@ -1026,6 +1105,7 @@ gstd_util_clamp_suite (void)
     tcase_add_test (fake, test_fake_realtime_threads_untouched);
     tcase_add_test (fake, test_fake_promoted_thread_released);
     tcase_add_test (fake, test_fake_promoted_thread_released_without_reset);
+    tcase_add_test (fake, test_fake_promoted_thread_released_at_rt_default);
     tcase_add_test (fake, test_fake_capped_thread_skipped);
     tcase_add_test (fake, test_fake_transient_error_retried);
     tcase_add_test (fake, test_fake_unsupported_kernel_disables);
