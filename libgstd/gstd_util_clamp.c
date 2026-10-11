@@ -94,6 +94,27 @@ struct gstd_sched_attr
 #define GSTD_SCHED_FLAG_KEEP_PARAMS 0x10
 #define GSTD_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
 
+/* The kernel's own default since Linux 5.11, where the sysctl appeared */
+#define GSTD_UTIL_CLAMP_RT_DEFAULT_FALLBACK GSTD_UTIL_CLAMP_SCALE
+
+static guint
+gstd_util_clamp_kernel_rt_default (void)
+{
+  gchar *contents = NULL;
+  guint64 value = GSTD_UTIL_CLAMP_RT_DEFAULT_FALLBACK;
+
+  if (g_file_get_contents ("/proc/sys/kernel/sched_util_clamp_min_rt_default",
+          &contents, NULL, NULL)) {
+    gchar *end = NULL;
+    guint64 parsed = g_ascii_strtoull (g_strstrip (contents), &end, 10);
+
+    if (end && *end == '\0' && parsed <= GSTD_UTIL_CLAMP_SCALE)
+      value = parsed;
+  }
+  g_free (contents);
+  return (guint) value;
+}
+
 static gint
 gstd_util_clamp_kernel_get_attr (gint tid, struct gstd_sched_attr *attr)
 {
@@ -144,6 +165,7 @@ gstd_util_clamp_kernel_set_min (gint tid, guint util_min)
 static const GstdUtilClampBackend gstd_util_clamp_kernel = {
   gstd_util_clamp_kernel_get,
   gstd_util_clamp_kernel_set_min,
+  gstd_util_clamp_kernel_rt_default,
 };
 
 static const GstdUtilClampBackend *backend = &gstd_util_clamp_kernel;
@@ -164,8 +186,7 @@ typedef enum
 static gboolean
 gstd_util_clamp_is_realtime (guint policy)
 {
-  return policy == GSTD_SCHED_FIFO || policy == GSTD_SCHED_RR
-      || policy == GSTD_SCHED_DEADLINE;
+  return policy == GSTD_SCHED_FIFO || policy == GSTD_SCHED_RR;
 }
 
 static GstdUtilClampResult
@@ -177,12 +198,40 @@ gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
   if (*error != 0)
     return GSTD_UTIL_CLAMP_FAILED;
 
-  /* Real-time threads keep the kernel's boost: writing a clamp would make
-   * it user-defined and opt them out of it for good */
-  if (gstd_util_clamp_is_realtime (thread.policy))
+  /* Deadline threads are scheduled by bandwidth, not utilization */
+  if (thread.policy == GSTD_SCHED_DEADLINE)
     return GSTD_UTIL_CLAMP_SKIPPED;
 
-  if (raise) {
+  if (gstd_util_clamp_is_realtime (thread.policy)) {
+    guint rt_default;
+
+    /* Writing a clamp makes it user-defined and opts a real-time thread out
+     * of the kernel's boost for good, so a raise never touches one */
+    if (raise)
+      return GSTD_UTIL_CLAMP_SKIPPED;
+
+    /* A real-time thread at exactly gstd's value was clamped before it
+     * switched policy, or holds the kernel's own boost when that value is
+     * the real-time default. The reset is right for both: it clears the
+     * user-defined flag, so a thread that later leaves real-time drops to
+     * 0 instead of keeping gstd's floor. */
+    if (thread.util_min != value)
+      return GSTD_UTIL_CLAMP_SKIPPED;
+
+    *error = backend->set_min (tid, GSTD_UTIL_CLAMP_RESET);
+    if (*error == EINVAL) {
+      /* Before Linux 5.11 there is no reset, and writing the number sets
+       * the flag. At the real-time default that would pin a thread that
+       * merely had the kernel's boost, so leave it; otherwise write the
+       * default explicitly. */
+      rt_default = backend->rt_default ();
+      if (value == rt_default) {
+        *error = 0;
+        return GSTD_UTIL_CLAMP_SKIPPED;
+      }
+      *error = backend->set_min (tid, rt_default);
+    }
+  } else if (raise) {
     /* Already enough, or capped below the floor by its maximum clamp */
     if (thread.util_min >= value || thread.util_max < value)
       return GSTD_UTIL_CLAMP_SKIPPED;
@@ -192,8 +241,7 @@ gstd_util_clamp_thread (gint tid, guint value, gboolean raise, gint * error)
     if (thread.util_min != value)
       return GSTD_UTIL_CLAMP_SKIPPED;
     *error = backend->set_min (tid, GSTD_UTIL_CLAMP_RESET);
-    /* Before Linux 5.11 there is no reset; 0 is the default for every
-     * policy this reaches */
+    /* Before Linux 5.11 there is no reset; 0 is the default here */
     if (*error == EINVAL)
       *error = backend->set_min (tid, 0);
   }
