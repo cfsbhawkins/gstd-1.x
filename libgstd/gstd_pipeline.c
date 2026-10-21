@@ -48,10 +48,12 @@ enum
   PROP_GRAPH,
   PROP_VERBOSE,
   PROP_REFCOUNT,
+  PROP_METADATA,
   N_PROPERTIES                  // NOT A PROPERTY
 };
 
 #define GSTD_PIPELINE_DEFAULT_DESCRIPTION NULL
+#define GSTD_PIPELINE_DEFAULT_METADATA NULL
 #define GSTD_PIPELINE_DEFAULT_STATE GSTD_PIPELINE_NULL
 #define GSTD_PIPELINE_DEFAULT_GRAPH NULL
 #define GSTD_PIPELINE_DEFAULT_VERBOSE FALSE
@@ -76,6 +78,13 @@ struct _GstdPipeline
    * The GstLaunch syntax used to create the pipeline
    */
   gchar *description;
+
+  /**
+   * An opaque string a client stores alongside the pipeline, or NULL when
+   * none is set (an empty string clears it). Gstd never interprets it and
+   * never logs its value. Guarded by the object lock, including in dispose.
+   */
+  gchar *metadata;
 
   /**
    * The gstd event handler for this pipeline
@@ -218,6 +227,15 @@ gstd_pipeline_class_init (GstdPipelineClass * klass)
       "Reference count of pipeline creation",
       0, G_MAXINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
 
+  properties[PROP_METADATA] =
+      g_param_spec_string ("metadata", "Metadata",
+      "Opaque client-owned string kept with the pipeline; never interpreted "
+      "or logged by the daemon. Unset reads back empty; setting an empty "
+      "string unsets it",
+      GSTD_PIPELINE_DEFAULT_METADATA,
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GSTD_PARAM_READ |
+      GSTD_PARAM_UPDATE);
+
   g_object_class_install_properties (object_class, N_PROPERTIES, properties);
 
   /* Initialize debug category with nice colors */
@@ -231,6 +249,7 @@ gstd_pipeline_init (GstdPipeline * self)
 {
   GST_INFO_OBJECT (self, "Initializing pipeline");
   self->description = g_strdup (GSTD_PIPELINE_DEFAULT_DESCRIPTION);
+  self->metadata = NULL;
   self->pipeline = NULL;
   self->event_handler = NULL;
   self->pipeline_bus = NULL;
@@ -319,6 +338,18 @@ gstd_pipeline_dispose (GObject * object)
     self->description = NULL;
   }
 
+  {
+    /* A set that has already dropped the object lock may still be running
+     * on another thread; take the lock so the free cannot race it. */
+    gchar *metadata;
+
+    GST_OBJECT_LOCK (self);
+    metadata = self->metadata;
+    self->metadata = NULL;
+    GST_OBJECT_UNLOCK (self);
+    g_free (metadata);
+  }
+
   if (self->pipeline_bus) {
     g_object_unref (self->pipeline_bus);
     self->pipeline_bus = NULL;
@@ -404,6 +435,15 @@ gstd_pipeline_get_property (GObject * object,
       GST_OBJECT_UNLOCK (self);
       break;
 
+    case PROP_METADATA:
+      /* The value is client data: report its size, never its content */
+      GST_OBJECT_LOCK (self);
+      GST_DEBUG_OBJECT (self, "Returning metadata (%" G_GSIZE_FORMAT " bytes)",
+          self->metadata ? strlen (self->metadata) : 0);
+      g_value_set_string (value, self->metadata);
+      GST_OBJECT_UNLOCK (self);
+      break;
+
     case PROP_POSITION:
       /* Ref pipeline to prevent use-after-free if deleted by another thread */
       if (self->pipeline) {
@@ -472,6 +512,33 @@ gstd_pipeline_set_property (GObject * object,
       /* dispose unrefs self->state, so take a ref rather than borrow */
       self->state = g_value_dup_object (value);
       break;
+
+    case PROP_METADATA:
+    {
+      /* Replace under the lock so a concurrent read never sees a freed
+       * string; the old value is released outside it. Nothing touches
+       * the new string after the unlock: a concurrent set may already
+       * have replaced and freed it. An empty string unsets. */
+      gchar *previous;
+      gchar *next = g_value_dup_string (value);
+      gsize length = 0;
+
+      if (next && next[0] == '\0') {
+        g_free (next);
+        next = NULL;
+      }
+      if (next) {
+        length = strlen (next);
+      }
+      GST_OBJECT_LOCK (self);
+      previous = self->metadata;
+      self->metadata = next;
+      GST_OBJECT_UNLOCK (self);
+      g_free (previous);
+      GST_INFO_OBJECT (self, "Changed metadata (%" G_GSIZE_FORMAT " bytes)",
+          length);
+      break;
+    }
 
 #if GST_VERSION_MINOR >= 10
     case PROP_VERBOSE:
