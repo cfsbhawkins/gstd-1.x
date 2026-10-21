@@ -59,6 +59,9 @@ gstd_list_create (GstdObject * object, const gchar * name,
     const gchar * description);
 static GstdReturnCode
 gstd_list_delete (GstdObject * object, const gchar * name);
+static GstdReturnCode gstd_list_create_full (GstdList * self,
+    const gchar * name, const gchar * description, const gchar * property,
+    const gchar * value);
 static GstdReturnCode gstd_list_to_string (GstdObject *, gchar **);
 
 G_DEFINE_TYPE (GstdList, gstd_list, GSTD_TYPE_OBJECT);
@@ -271,13 +274,36 @@ static GstdReturnCode
 gstd_list_create (GstdObject * object, const gchar * name,
     const gchar * description)
 {
-  GstdList *self;
+  g_return_val_if_fail (GSTD_IS_LIST (object), GSTD_NULL_ARGUMENT);
+
+  return gstd_list_create_full (GSTD_LIST (object), name, description, NULL,
+      NULL);
+}
+
+GstdReturnCode
+gstd_list_create_with_property (GstdList * self, const gchar * name,
+    const gchar * description, const gchar * property, const gchar * value)
+{
+  g_return_val_if_fail (GSTD_IS_LIST (self), GSTD_NULL_ARGUMENT);
+  g_return_val_if_fail (property, GSTD_NULL_ARGUMENT);
+  g_return_val_if_fail (value, GSTD_NULL_ARGUMENT);
+
+  return gstd_list_create_full (self, name, description, property, value);
+}
+
+/*
+ * Creates and publishes a resource. When @property is given, the new
+ * object must expose it as a writable string property; it is set before
+ * the object is committed to the list, and a type without it is rejected
+ * without being published.
+ */
+static GstdReturnCode
+gstd_list_create_full (GstdList * self, const gchar * name,
+    const gchar * description, const gchar * property, const gchar * value)
+{
+  GstdObject *object = GSTD_OBJECT (self);
   GstdObject *out = NULL;
   GstdReturnCode ret = GSTD_EOK;
-
-  g_return_val_if_fail (GSTD_IS_OBJECT (object), GSTD_NULL_ARGUMENT);
-
-  self = GSTD_LIST (object);
 
   g_return_val_if_fail (object->creator, GSTD_MISSING_INITIALIZATION);
 
@@ -304,6 +330,21 @@ gstd_list_create (GstdObject * object, const gchar * name,
   if (NULL == out) {
     ret = GSTD_BAD_COMMAND;
     goto error;
+  }
+
+  if (property) {
+    GParamSpec *pspec =
+        g_object_class_find_property (G_OBJECT_GET_CLASS (out), property);
+
+    if (!pspec || pspec->value_type != G_TYPE_STRING
+        || !(pspec->flags & G_PARAM_WRITABLE)) {
+      GST_ERROR_OBJECT (object,
+          "\"%s\" resources have no writable \"%s\" string property",
+          GSTD_OBJECT_NAME (self), property);
+      ret = GSTD_NO_RESOURCE;
+      goto error;
+    }
+    g_object_set (out, property, value, NULL);
   }
 
   /* Consumes the reservation; fails only for a duplicate name */

@@ -79,6 +79,27 @@ struct _GstdListClass
 GType gstd_list_get_type (void);
 
 GstdObject *gstd_list_find_child (GstdList * self, const gchar * name);
+
+/**
+ * gstd_list_create_with_property:
+ * @self: the list to create the resource in
+ * @name: the resource name
+ * @description: the resource description, may be NULL
+ * @property: the name of a writable string property of the new resource
+ * @value: the value to store in @property
+ *
+ * Creates a resource like a `create` command would, but stores @value in
+ * @property on the new object before it is published in the list, so no
+ * reader of the list ever sees the resource without it. The value is set
+ * directly, never through the text command language, so it is kept
+ * verbatim. A resource type without such a property fails with
+ * GSTD_NO_RESOURCE and nothing is created.
+ *
+ * Returns: GSTD_EOK on success, or the failure
+ */
+GstdReturnCode gstd_list_create_with_property (GstdList * self,
+    const gchar * name, const gchar * description, const gchar * property,
+    const gchar * value);
 gboolean gstd_list_append_child (GstdList *, GstdObject * child);
 
 G_END_DECLS

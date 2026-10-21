@@ -110,14 +110,18 @@ static SoupStatus get_status_code (GstdReturnCode ret);
 static GstdReturnCode do_get (SoupServer * server, SoupMsg * msg,
     char **output, const char *path, GstdSession * session);
 static GstdReturnCode do_post (SoupServer * server, SoupMsg * msg,
-    char *name, char *description, char **output, const char *path,
+    char *name, char *description, const char *metadata, char **output,
+    const char *path,
     GstdSession * session);
 static GstdReturnCode do_put (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
+static GstdReturnCode do_put_metadata (const char *value, char **output,
+    const char *path, GstdSession * session);
 static GstdReturnCode do_delete (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
 static void do_request (gpointer data_request, gpointer eval);
-static void parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc);
+static void parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc,
+    gchar **out_metadata, gboolean *out_metadata_invalid);
 static gchar *json_escape_string (const gchar * s);
 #if SOUP_CHECK_VERSION(3,0,0)
 static void server_callback (SoupServer * server, SoupMsg * msg,
@@ -682,9 +686,20 @@ do_get (SoupServer * server, SoupMsg * msg, char **output, const char *path,
   return ret;
 }
 
+/*
+ * Create a resource. When @metadata is given the target must be a list
+ * whose resources carry a writable "metadata" string property (pipelines):
+ * the value is stored on the new object before it is published, directly
+ * and verbatim rather than through the text command language, so no client
+ * ever observes the resource without it and no side effect happens for a
+ * resource type that cannot carry it. The response is the resource as
+ * published, metadata included. The metadata value is client data and is
+ * not logged.
+ */
 static GstdReturnCode
 do_post (SoupServer * server, SoupMsg * msg, char *name,
-    char *description, char **output, const char *path, GstdSession * session)
+    char *description, const char *metadata, char **output,
+    const char *path, GstdSession * session)
 {
   gchar *message = NULL;
   GstdReturnCode ret = GSTD_EOK;
@@ -707,6 +722,33 @@ do_post (SoupServer * server, SoupMsg * msg, char *name,
     ret = GSTD_BAD_VALUE;
     GST_ERROR_OBJECT (session,
         "Rejecting \"name\" with whitespace or control characters");
+    goto out;
+  }
+
+  if (metadata) {
+    GstdObject *node = NULL;
+    GstdObject *created = NULL;
+
+    ret = gstd_get_by_uri (session, path, &node);
+    if (ret != GSTD_EOK || NULL == node) {
+      goto out;
+    }
+    if (!GSTD_IS_LIST (node)) {
+      GST_ERROR_OBJECT (session,
+          "Rejecting \"metadata\": \"%s\" is not a resource list", path);
+      g_object_unref (node);
+      ret = GSTD_BAD_VALUE;
+      goto out;
+    }
+    ret = gstd_list_create_with_property (GSTD_LIST (node), name,
+        description, "metadata", metadata);
+    if (ret == GSTD_EOK
+        && gstd_object_read (node, name, &created) == GSTD_EOK
+        && created != NULL) {
+      gstd_object_to_string (created, output);
+      g_object_unref (created);
+    }
+    g_object_unref (node);
     goto out;
   }
 
@@ -745,6 +787,14 @@ do_put (SoupServer * server, SoupMsg * msg, char *name, char **output,
     goto out;
   }
 
+  if (g_str_has_suffix (path, "/metadata")) {
+    /* The metadata string is client data: store it verbatim rather than
+     * through the text command language, whose deserializer would unwrap
+     * quotes and turn the token NULL into no value. */
+    ret = do_put_metadata (name, output, path, session);
+    goto out;
+  }
+
   message = g_strdup_printf ("update %s %s", path, name);
   ret = gstd_parser_parse_cmd (session, message, output);
   g_free (message);
@@ -752,6 +802,50 @@ do_put (SoupServer * server, SoupMsg * msg, char *name, char **output,
 
 out:
   return ret;
+}
+
+/*
+ * Replace the "metadata" property of the resource that owns @path, where
+ * @path is "<resource path>/metadata", and answer with the property as
+ * stored. Only resources with a writable "metadata" string property accept
+ * it.
+ */
+static GstdReturnCode
+do_put_metadata (const char *value, char **output, const char *path,
+    GstdSession * session)
+{
+  gchar *owner_path;
+  GstdObject *owner = NULL;
+  GstdObject *property = NULL;
+  GParamSpec *pspec;
+  GstdReturnCode ret;
+
+  owner_path = g_strndup (path, strlen (path) - strlen ("/metadata"));
+  ret = gstd_get_by_uri (session, owner_path, &owner);
+  g_free (owner_path);
+  if (ret != GSTD_EOK || NULL == owner) {
+    return ret != GSTD_EOK ? ret : GSTD_NO_RESOURCE;
+  }
+
+  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (owner),
+      "metadata");
+  if (!pspec || pspec->value_type != G_TYPE_STRING
+      || !(pspec->flags & G_PARAM_WRITABLE)) {
+    GST_ERROR_OBJECT (session, "\"%s\" has no writable metadata", path);
+    g_object_unref (owner);
+    return GSTD_NO_RESOURCE;
+  }
+
+  g_object_set (owner, "metadata", value, NULL);
+
+  if (gstd_object_read (owner, "metadata", &property) == GSTD_EOK
+      && property != NULL) {
+    gstd_object_to_string (property, output);
+    g_object_unref (property);
+  }
+  g_object_unref (owner);
+
+  return GSTD_EOK;
 }
 
 static GstdReturnCode
@@ -797,6 +891,8 @@ do_request (gpointer data_request, gpointer eval)
   gchar *response = NULL;
   gchar *name = NULL;
   gchar *description_pipe = NULL;
+  gchar *metadata = NULL;
+  gboolean metadata_invalid = FALSE;
   GstdReturnCode ret = GSTD_BAD_COMMAND;
   gchar *output = NULL;
   const gchar *description = NULL;
@@ -826,7 +922,8 @@ do_request (gpointer data_request, gpointer eval)
   query = data_request_local->query;
   g_mutex_unlock (data_request_local->mutex);
 
-  parse_json_body (msg, &name, &description_pipe);
+  parse_json_body (msg, &name, &description_pipe, &metadata,
+      &metadata_invalid);
 
   if (!name && query) {
     name = g_strdup (g_hash_table_lookup (query, "name"));
@@ -834,15 +931,24 @@ do_request (gpointer data_request, gpointer eval)
   if (!description_pipe && query) {
     description_pipe = g_strdup (g_hash_table_lookup (query, "description"));
   }
+  if (!metadata && query) {
+    metadata = g_strdup (g_hash_table_lookup (query, "metadata"));
+  }
 #if SOUP_CHECK_VERSION(3,0,0)
   method = soup_server_message_get_method (msg);
 #else
   method = msg->method;
 #endif
-  if (method == SOUP_METHOD_GET) {
+  if (metadata_invalid) {
+    /* Present but not a string: refuse before any resource is created,
+     * rather than silently creating it without the metadata */
+    GST_ERROR_OBJECT (session, "Rejecting non-string \"metadata\" member");
+    ret = GSTD_BAD_VALUE;
+  } else if (method == SOUP_METHOD_GET) {
     ret = do_get (server, msg, &output, path, session);
   } else if (method == SOUP_METHOD_POST) {
-    ret = do_post (server, msg, name, description_pipe, &output, path, session);
+    ret = do_post (server, msg, name, description_pipe, metadata, &output,
+        path, session);
   } else if (method == SOUP_METHOD_PUT) {
     ret = do_put (server, msg, name, &output, path, session);
   } else if (method == SOUP_METHOD_DELETE) {
@@ -852,8 +958,10 @@ do_request (gpointer data_request, gpointer eval)
   }
   g_free (name);
   g_free (description_pipe);
+  g_free (metadata);
   name = NULL;
   description_pipe = NULL;
+  metadata = NULL;
 
   description = gstd_return_code_to_string (ret);
   response =
@@ -901,7 +1009,8 @@ do_request (gpointer data_request, gpointer eval)
 }
 
 static void
-parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
+parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc,
+    gchar **out_metadata, gboolean *out_metadata_invalid)
 {
   const char *content_type = NULL;
   JsonParser *parser = NULL;
@@ -920,9 +1029,13 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
   g_return_if_fail (msg);
   g_return_if_fail (out_name);
   g_return_if_fail (out_desc);
+  g_return_if_fail (out_metadata);
+  g_return_if_fail (out_metadata_invalid);
 
   *out_name = NULL;
   *out_desc = NULL;
+  *out_metadata = NULL;
+  *out_metadata_invalid = FALSE;
 
 #if SOUP_CHECK_VERSION(3,0,0)
   request_body = soup_server_message_get_request_body (msg);
@@ -991,6 +1104,17 @@ parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc)
     if (json_object_has_member (obj, "description")) {
       const char *value = json_object_get_string_member (obj, "description");
       if (value) *out_desc = g_strdup (value);
+    }
+    if (json_object_has_member (obj, "metadata")) {
+      /* JSON null means "none", like an absent member; any other
+       * non-string is a client error, reported rather than ignored */
+      JsonNode *member = json_object_get_member (obj, "metadata");
+      if (JSON_NODE_HOLDS_VALUE (member)
+          && json_node_get_value_type (member) == G_TYPE_STRING) {
+        *out_metadata = g_strdup (json_node_get_string (member));
+      } else if (!JSON_NODE_HOLDS_NULL (member)) {
+        *out_metadata_invalid = TRUE;
+      }
     }
   }
   g_object_unref (parser);

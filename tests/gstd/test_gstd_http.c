@@ -1283,6 +1283,300 @@ GST_START_TEST (test_http_cors_origin_cli_rejected)
 }
 GST_END_TEST;
 
+
+/*
+ * Test: a JSON create body may carry "metadata", stored on the new
+ * pipeline within the same request and readable at its property path
+ */
+GST_START_TEST (test_http_create_with_metadata_body)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"meta_pipe\", \"description\": \"fakesrc ! fakesink\", "
+      "\"metadata\": \"eyJrZXkiOiAidmFsdWUifQ==\"}", 0, &status_code);
+  fail_if (status_code != 200,
+      "JSON create with metadata returned %u, expected 200", status_code);
+  /* The create response is the pipeline as published, metadata included */
+  fail_if (strstr (response, "eyJrZXkiOiAidmFsdWUifQ") == NULL,
+      "Create response lacks the metadata: %s", response);
+  g_free (response);
+
+  response = http_get ("/pipelines/meta_pipe/metadata", &status_code);
+  fail_if (status_code != 200, "GET metadata returned %u", status_code);
+  /* String properties read back gst_value_serialize'd (quoted, with the
+   * padding escaped), so match the payload rather than the exact form */
+  fail_if (strstr (response, "eyJrZXkiOiAidmFsdWUifQ") == NULL,
+      "Metadata was not stored at create: %s", response);
+  g_free (response);
+
+  /* A pipeline created without metadata reads back an empty value */
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"plain_pipe\", \"description\": \"fakesrc ! fakesink\"}",
+      0, &status_code);
+  fail_if (status_code != 200, "JSON create returned %u", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/plain_pipe/metadata", &status_code);
+  fail_if (status_code != 200, "GET metadata returned %u", status_code);
+  fail_if (strstr (response, "\"value\" : \"\"") == NULL,
+      "Expected empty metadata: %s", response);
+  g_free (response);
+
+  /* The pipeline dump reports the unset property as null */
+  response = http_get ("/pipelines/plain_pipe", &status_code);
+  fail_if (status_code != 200, "GET pipeline returned %u", status_code);
+  {
+    const gchar *at = strstr (response, "\"name\" : \"metadata\"");
+    fail_if (at == NULL, "Pipeline dump lacks metadata: %s", response);
+    fail_if (strstr (at, "\"value\" : null") == NULL,
+        "Expected the unset metadata as null: %s", at);
+  }
+  g_free (response);
+
+  /* JSON null means none, like an absent member */
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"null_pipe\", \"description\": \"fakesrc ! fakesink\", "
+      "\"metadata\": null}", 0, &status_code);
+  fail_if (status_code != 200, "JSON create with null metadata returned %u",
+      status_code);
+  g_free (response);
+
+  /* Any other non-string is refused before anything is created */
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"bad_meta\", \"description\": \"fakesrc ! fakesink\", "
+      "\"metadata\": {\"k\": \"v\"}}", 0, &status_code);
+  fail_if (status_code == 200,
+      "JSON create with an object metadata must fail: %s", response);
+  g_free (response);
+
+  response = http_get ("/pipelines/status", &status_code);
+  fail_if (strstr (response, "bad_meta") != NULL,
+      "A refused create must not leave a pipeline behind: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: the query form of create also accepts metadata
+ */
+GST_START_TEST (test_http_create_with_metadata_query)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request ("POST",
+      "/pipelines?name=query_pipe&description=fakesrc%20!%20fakesink"
+      "&metadata=from-query", NULL, &status_code, NULL);
+  fail_if (status_code != 200,
+      "Query create with metadata returned %u, expected 200", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/query_pipe/metadata", &status_code);
+  fail_if (status_code != 200, "GET metadata returned %u", status_code);
+  fail_if (strstr (response, "from-query") == NULL,
+      "Metadata from the query was not stored: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: PUT on the metadata path replaces the value, with the new value in
+ * the JSON body like every other PUT
+ */
+GST_START_TEST (test_http_update_metadata_body)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"upd_pipe\", \"description\": \"fakesrc ! fakesink\", "
+      "\"metadata\": \"first\"}", 0, &status_code);
+  fail_if (status_code != 200, "Create returned %u", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/metadata",
+      "application/json", BODY_FIXED, "{\"name\": \"second value\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT metadata returned %u, expected 200",
+      status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/upd_pipe/metadata", &status_code);
+  fail_if (status_code != 200, "GET metadata returned %u", status_code);
+  fail_if (strstr (response, "second\\\\ value") == NULL,
+      "Metadata was not replaced: %s", response);
+  fail_if (strstr (response, "first") != NULL,
+      "The previous metadata must be gone: %s", response);
+  g_free (response);
+
+  /* The pipeline itself still works after metadata updates */
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/state",
+      "application/json", BODY_FIXED, "{\"name\": \"playing\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT state returned %u", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/upd_pipe/metadata", &status_code);
+  fail_if (strstr (response, "second\\\\ value") == NULL,
+      "Metadata must survive a state change: %s", response);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/state",
+      "application/json", BODY_FIXED, "{\"name\": \"null\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT state null returned %u", status_code);
+  g_free (response);
+
+  /* The value is stored verbatim, not through the text command language:
+   * the token NULL and a quote-wrapped value survive */
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/metadata",
+      "application/json", BODY_FIXED, "{\"name\": \"NULL\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT metadata NULL returned %u", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/upd_pipe/metadata", &status_code);
+  /* Stored as text, so the serializer wraps it to tell it from no value */
+  fail_if (strstr (response, "\"value\" : \"\\\"NULL\\\"\"") == NULL,
+      "The token NULL must be stored as text: %s", response);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/metadata",
+      "application/json", BODY_FIXED, "{\"name\": \"\\\"quoted\\\"\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT quoted metadata returned %u",
+      status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/upd_pipe/metadata", &status_code);
+  /* Read back serialized: the kept quotes are escaped inside the wrapper */
+  fail_if (strstr (response, "\\\\\\\"quoted\\\\\\\"") == NULL,
+      "The quotes must be kept: %s", response);
+  g_free (response);
+
+  /* An empty value unsets */
+  response = http_request_with_body ("PUT", "/pipelines/upd_pipe/metadata",
+      "application/json", BODY_FIXED, "{\"name\": \"\"}", 0, &status_code);
+  fail_if (status_code != 200, "PUT empty metadata returned %u", status_code);
+  g_free (response);
+
+  response = http_get ("/pipelines/upd_pipe/metadata", &status_code);
+  fail_if (strstr (response, "\"value\" : \"\"") == NULL,
+      "Expected the metadata unset: %s", response);
+  g_free (response);
+
+  /* Only resources with the property accept it */
+  response = http_request_with_body ("PUT",
+      "/pipelines/upd_pipe/elements/fakesrc0/metadata", "application/json",
+      BODY_FIXED, "{\"name\": \"x\"}", 0, &status_code);
+  fail_if (status_code == 200,
+      "PUT metadata on an element must fail: %s", response);
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
+ * Test: metadata on a creatable resource that has no such property is
+ * refused before the create runs, so a side-effecting create (an event)
+ * does nothing; the same create without metadata succeeds
+ */
+GST_START_TEST (test_http_create_metadata_refused_without_side_effect)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  response = http_request_with_body ("POST", "/pipelines",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"rb_pipe\", \"description\": \"fakesrc ! fakesink\"}",
+      0, &status_code);
+  fail_if (status_code != 200, "Create returned %u", status_code);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/rb_pipe/state",
+      "application/json", BODY_FIXED, "{\"name\": \"playing\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT state returned %u", status_code);
+  g_free (response);
+
+  /* Watch the bus for EOS with a short timeout */
+  response = http_request ("PUT", "/pipelines/rb_pipe/bus/types?name=eos",
+      NULL, &status_code, NULL);
+  fail_if (status_code != 200, "PUT bus types returned %u", status_code);
+  g_free (response);
+  response = http_request ("PUT",
+      "/pipelines/rb_pipe/bus/timeout?name=200000000", NULL, &status_code,
+      NULL);
+  fail_if (status_code != 200, "PUT bus timeout returned %u", status_code);
+  g_free (response);
+
+  /* Events are created through the same POST path but carry no metadata
+   * property: the request is refused before the event is sent */
+  response = http_request_with_body ("POST", "/pipelines/rb_pipe/event",
+      "application/json", BODY_FIXED,
+      "{\"name\": \"eos\", \"metadata\": \"unsupported-here\"}",
+      0, &status_code);
+  fail_if (status_code == 200,
+      "Create with metadata on a resource without the property must fail: %s",
+      response);
+  g_free (response);
+
+  response = http_get ("/pipelines/rb_pipe/bus/message", &status_code);
+  fail_if (strstr (response, "eos") != NULL,
+      "The refused create must not have sent the event: %s", response);
+  g_free (response);
+
+  response = http_request_with_body ("POST", "/pipelines/rb_pipe/event",
+      "application/json", BODY_FIXED, "{\"name\": \"eos\"}", 0,
+      &status_code);
+  fail_if (status_code != 200,
+      "The same create without metadata should succeed, got %u: %s",
+      status_code, response);
+  g_free (response);
+
+  response = http_get ("/pipelines/rb_pipe/bus/message", &status_code);
+  fail_if (strstr (response, "eos") == NULL,
+      "The plain create should have sent the event: %s", response);
+  g_free (response);
+
+  response = http_request_with_body ("PUT", "/pipelines/rb_pipe/state",
+      "application/json", BODY_FIXED, "{\"name\": \"null\"}", 0,
+      &status_code);
+  fail_if (status_code != 200, "PUT state null returned %u", status_code);
+  g_free (response);
+}
+GST_END_TEST;
+
 static Suite *
 gstd_http_suite (void)
 {
@@ -1321,6 +1615,10 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_cors_origin_property_validation);
   tcase_add_test (tc, test_http_cors_origin_env_rejected);
   tcase_add_test (tc, test_http_cors_origin_cli_rejected);
+  tcase_add_test (tc, test_http_create_with_metadata_body);
+  tcase_add_test (tc, test_http_create_with_metadata_query);
+  tcase_add_test (tc, test_http_update_metadata_body);
+  tcase_add_test (tc, test_http_create_metadata_refused_without_side_effect);
 
   return suite;
 }
