@@ -58,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at once.
 
 ### Fixed
+- **HTTP requests are completed on the server thread** (`gstd_http.c`).
+  A request that is not a fast path runs on a pool thread, and that thread
+  used to read the request from the libsoup message, write the response
+  into it, resume it, and drop the last reference to it. libsoup is not
+  thread safe: the server thread works on the same message and connection
+  at the same time, most visibly when the client disconnects or reuses the
+  connection just as the response is produced. Under load, most readily
+  with the daemon short of CPU, this corrupted the heap and crashed the
+  daemon. The server thread now reads the method, body and query before
+  it queues the request, the pool thread uses only that copy, and the
+  result is applied to the message, and the message released, from an
+  idle source on the server's main context. The per-request use of the
+  `GstdHttp` mutex around pause and resume is gone, since both now happen
+  on one thread. A request the pool reports it could not start a thread
+  for is no longer freed while it is still queued.
 - **Utilization clamp ownership, retries and locking**
   (`gstd_util_clamp.c`, `gstd_session.c`). Post-merge review of the clamp.
   A raise that reached only some threads was recorded as complete, so the

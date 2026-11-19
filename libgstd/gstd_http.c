@@ -53,14 +53,25 @@ typedef SoupServerMessage SoupMsg;
 typedef SoupMessage SoupMsg;
 #endif
 
+/* One request handed to the worker pool. libsoup objects belong to the
+ * thread that runs the server's main context, so the server thread fills
+ * in everything a worker needs before queueing the request, and the
+ * worker hands its result back to that thread instead of touching `msg`
+ * or `server`. Both are only carried through to the completion. */
 typedef struct _GstdHttpRequest
 {
   SoupServer *server;
   SoupMsg *msg;
+  GMainContext *context;
   GstdSession *session;
   const char *path;
-  GHashTable *query;
-  GMutex *mutex;
+  const char *method;
+  gchar *name;
+  gchar *description;
+  gchar *metadata;
+  gboolean metadata_invalid;
+  gchar *response;
+  SoupStatus status;
 } GstdHttpRequest;
 
 struct _GstdHttp
@@ -120,6 +131,8 @@ static GstdReturnCode do_put_metadata (const char *value, char **output,
 static GstdReturnCode do_delete (SoupServer * server, SoupMsg * msg,
     char *name, char **output, const char *path, GstdSession * session);
 static void do_request (gpointer data_request, gpointer eval);
+static gboolean complete_request (gpointer data_request);
+static void gstd_http_request_free (GstdHttpRequest * request);
 static void parse_json_body (SoupMsg *msg, gchar **out_name, gchar **out_desc,
     gchar **out_metadata, gboolean *out_metadata_invalid);
 static gchar *json_escape_string (const gchar * s);
@@ -885,127 +898,112 @@ out:
   return ret;
 }
 
+/* Releases a request and the references it holds. Server thread only:
+ * dropping the last reference to a message finalizes it, which libsoup
+ * expects on the thread that runs the server. */
 static void
-do_request (gpointer data_request, gpointer eval)
+gstd_http_request_free (GstdHttpRequest * request)
 {
-  gchar *response = NULL;
-  gchar *name = NULL;
-  gchar *description_pipe = NULL;
-  gchar *metadata = NULL;
-  gboolean metadata_invalid = FALSE;
-  GstdReturnCode ret = GSTD_BAD_COMMAND;
-  gchar *output = NULL;
-  const gchar *description = NULL;
-  SoupStatus status = SOUP_STATUS_OK;
-  SoupServer *server = NULL;
-  SoupMsg *msg = NULL;
-  GstdSession *session = NULL;
-  const char *path = NULL;
-  GHashTable *query = NULL;
-  GstdHttpRequest *data_request_local = NULL;
-  const char *method;
+  g_free (request->name);
+  g_free (request->description);
+  g_free (request->metadata);
+  g_free (request->response);
+  g_object_unref (request->msg);
+  g_object_unref (request->server);
+  g_main_context_unref (request->context);
+  g_free (request);
+}
 
-  g_return_if_fail (data_request);
-
-  data_request_local = (GstdHttpRequest *) data_request;
-
-  /*
-   * Extract all fields from the request struct atomically.
-   * The struct may be accessed from multiple threads, so we need
-   * to copy everything we need under the lock.
-   */
-  g_mutex_lock (data_request_local->mutex);
-  server = data_request_local->server;
-  msg = data_request_local->msg;
-  session = data_request_local->session;
-  path = data_request_local->path;
-  query = data_request_local->query;
-  g_mutex_unlock (data_request_local->mutex);
-
-  parse_json_body (msg, &name, &description_pipe, &metadata,
-      &metadata_invalid);
-
-  if (!name && query) {
-    name = g_strdup (g_hash_table_lookup (query, "name"));
-  }
-  if (!description_pipe && query) {
-    description_pipe = g_strdup (g_hash_table_lookup (query, "description"));
-  }
-  if (!metadata && query) {
-    metadata = g_strdup (g_hash_table_lookup (query, "metadata"));
-  }
-#if SOUP_CHECK_VERSION(3,0,0)
-  method = soup_server_message_get_method (msg);
-#else
-  method = msg->method;
-#endif
-  if (metadata_invalid) {
-    /* Present but not a string: refuse before any resource is created,
-     * rather than silently creating it without the metadata */
-    GST_ERROR_OBJECT (session, "Rejecting non-string \"metadata\" member");
-    ret = GSTD_BAD_VALUE;
-  } else if (method == SOUP_METHOD_GET) {
-    ret = do_get (server, msg, &output, path, session);
-  } else if (method == SOUP_METHOD_POST) {
-    ret = do_post (server, msg, name, description_pipe, metadata, &output,
-        path, session);
-  } else if (method == SOUP_METHOD_PUT) {
-    ret = do_put (server, msg, name, &output, path, session);
-  } else if (method == SOUP_METHOD_DELETE) {
-    ret = do_delete (server, msg, name, &output, path, session);
-  } else if (method == SOUP_METHOD_OPTIONS) {
-    ret = GSTD_EOK;
-  }
-  g_free (name);
-  g_free (description_pipe);
-  g_free (metadata);
-  name = NULL;
-  description_pipe = NULL;
-  metadata = NULL;
-
-  description = gstd_return_code_to_string (ret);
-  response =
-      g_strdup_printf
-      ("{\n  \"code\" : %d,\n  \"description\" : \"%s\",\n  \"response\" : %s\n}",
-      ret, description, output ? output : "null");
-  g_free (output);
-  output = NULL;
+/* Finishes a request on the server thread: writes the worker's result
+ * into the message and resumes it. A client that went away while the
+ * worker ran may already have detached the message from its connection.
+ * Whether a resume still applies is libsoup's state, read here on the
+ * thread that owns it; either way the references are dropped. */
+static gboolean
+complete_request (gpointer data_request)
+{
+  GstdHttpRequest *request = (GstdHttpRequest *) data_request;
+  SoupMsg *msg = request->msg;
 
 #if SOUP_CHECK_VERSION(3,0,0)
   soup_server_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
-      response, strlen (response));
+      request->response, strlen (request->response));
+  soup_server_message_set_status (msg, request->status, NULL);
 #else
   soup_message_set_response (msg, "application/json", SOUP_MEMORY_COPY,
-      response, strlen (response));
+      request->response, strlen (request->response));
+  soup_message_set_status (msg, request->status);
 #endif
-  g_free (response);
-  response = NULL;
-
-  status = get_status_code (ret);
-
-#if SOUP_CHECK_VERSION(3,0,0)
-  soup_server_message_set_status (msg, status, NULL);
-#else
-  soup_message_set_status (msg, status);
-#endif
-
-  g_mutex_lock (data_request_local->mutex);
 
 #if SOUP_CHECK_VERSION(3,2,0)
   soup_server_message_unpause (msg);
 #else
-  soup_server_unpause_message (server, msg);
+  soup_server_unpause_message (request->server, msg);
 #endif
-  g_mutex_unlock (data_request_local->mutex);
 
-  if (query != NULL) {
-    g_hash_table_unref (query);
+  gstd_http_request_free (request);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Runs on a pool thread. Uses only what the server thread copied into
+ * the request, and returns the result to that thread through its main
+ * context: libsoup is not thread safe, and completing or releasing a
+ * message here races with the server thread working on the same
+ * connection. */
+static void
+do_request (gpointer data_request, gpointer eval)
+{
+  GstdHttpRequest *request = (GstdHttpRequest *) data_request;
+  GstdReturnCode ret = GSTD_BAD_COMMAND;
+  gchar *output = NULL;
+  const gchar *description = NULL;
+  const char *method;
+  GSource *source;
+
+  g_return_if_fail (request);
+
+  method = request->method;
+
+  if (request->metadata_invalid) {
+    /* Present but not a string: refuse before any resource is created,
+     * rather than silently creating it without the metadata */
+    GST_ERROR_OBJECT (request->session,
+        "Rejecting non-string \"metadata\" member");
+    ret = GSTD_BAD_VALUE;
+  } else if (method == SOUP_METHOD_GET) {
+    ret = do_get (request->server, request->msg, &output, request->path,
+        request->session);
+  } else if (method == SOUP_METHOD_POST) {
+    ret = do_post (request->server, request->msg, request->name,
+        request->description, request->metadata, &output, request->path,
+        request->session);
+  } else if (method == SOUP_METHOD_PUT) {
+    ret = do_put (request->server, request->msg, request->name, &output,
+        request->path, request->session);
+  } else if (method == SOUP_METHOD_DELETE) {
+    ret = do_delete (request->server, request->msg, request->name, &output,
+        request->path, request->session);
+  } else if (method == SOUP_METHOD_OPTIONS) {
+    ret = GSTD_EOK;
   }
-  g_object_unref (msg);
-  g_free (data_request);
-  data_request = NULL;
 
-  return;
+  description = gstd_return_code_to_string (ret);
+  request->response =
+      g_strdup_printf
+      ("{\n  \"code\" : %d,\n  \"description\" : \"%s\",\n  \"response\" : %s\n}",
+      ret, description, output ? output : "null");
+  g_free (output);
+  request->status = get_status_code (ret);
+
+  /* Always queued, never run inline: g_main_context_invoke() would run
+   * the completion on this thread whenever the context happens to be
+   * unowned. */
+  source = g_idle_source_new ();
+  g_source_set_priority (source, G_PRIORITY_DEFAULT);
+  g_source_set_callback (source, complete_request, request, NULL);
+  g_source_attach (source, request->context);
+  g_source_unref (source);
 }
 
 static void
@@ -1968,21 +1966,31 @@ server_callback (SoupServer * server, SoupMessage * msg,
 
   data_request = g_new0 (GstdHttpRequest, 1);
 
-  /* The worker thread completes this message after the pause below,
-   * possibly long after libsoup would have dropped its own references
-   * on a client disconnect. Hold a reference until the worker is done;
-   * it also keeps `path` valid, which is owned by the message's URI. */
+  /* The worker's result is applied to this message after the pause
+   * below, possibly long after libsoup would have dropped its own
+   * references on a client disconnect. Hold a reference until then; it
+   * also keeps `path` valid, which is owned by the message's URI. The
+   * request is read here, on the server thread, so the worker never
+   * touches the message. */
   data_request->msg = g_object_ref (msg);
-  data_request->server = server;
+  data_request->server = g_object_ref (server);
+  data_request->context = g_main_context_ref_thread_default ();
   data_request->session = session;
   data_request->path = path;
-  if (query) {
-    data_request->query = g_hash_table_ref (query);
-  } else {
-    data_request->query = query;
+  data_request->method = method;
+  parse_json_body (msg, &data_request->name, &data_request->description,
+      &data_request->metadata, &data_request->metadata_invalid);
+  if (!data_request->name && query) {
+    data_request->name = g_strdup (g_hash_table_lookup (query, "name"));
   }
-  data_request->mutex = &self->mutex;
-
+  if (!data_request->description && query) {
+    data_request->description =
+        g_strdup (g_hash_table_lookup (query, "description"));
+  }
+  if (!data_request->metadata && query) {
+    data_request->metadata =
+        g_strdup (g_hash_table_lookup (query, "metadata"));
+  }
 
 #if SOUP_CHECK_VERSION(3,0,0)
   response_headers = soup_server_message_get_response_headers (msg);
@@ -1990,34 +1998,17 @@ server_callback (SoupServer * server, SoupMessage * msg,
   response_headers = msg->response_headers;
 #endif
   add_cors_headers (self, response_headers, "PUT, GET, POST, DELETE");
-  g_mutex_lock (&self->mutex);
 #if SOUP_CHECK_VERSION(3,2,0)
   soup_server_message_pause (msg);
 #else
   soup_server_pause_message (server, msg);
 #endif
-  g_mutex_unlock (&self->mutex);
   if (!g_thread_pool_push (self->pool, (gpointer) data_request, NULL)) {
-    GST_ERROR_OBJECT (self, "Thread pool push failed");
-    /* Clean up the request that couldn't be queued */
-    if (data_request->query) {
-      g_hash_table_unref (data_request->query);
-    }
-    g_object_unref (data_request->msg);
-    g_free (data_request);
-    /* Unpause the message so libsoup can complete it with an error */
-    g_mutex_lock (&self->mutex);
-#if SOUP_CHECK_VERSION(3,0,0)
-    soup_server_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE, NULL);
-#else
-    soup_message_set_status (msg, SOUP_STATUS_SERVICE_UNAVAILABLE);
-#endif
-#if SOUP_CHECK_VERSION(3,2,0)
-    soup_server_message_unpause (msg);
-#else
-    soup_server_unpause_message (server, msg);
-#endif
-    g_mutex_unlock (&self->mutex);
+    /* The pool could not start another thread. The request is queued all
+     * the same and still belongs to the pool, so it must not be freed
+     * here; a thread that is already running picks it up. */
+    GST_WARNING_OBJECT (self, "Thread pool could not start a thread; "
+        "request stays queued");
   }
 
 }
