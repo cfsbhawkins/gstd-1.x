@@ -494,6 +494,57 @@ GST_START_TEST (test_http_concurrent_requests)
 GST_END_TEST;
 
 /*
+ * Test: A client that disconnects before its response is ready
+ *
+ * Pool-thread requests are completed on the server thread. A client that
+ * goes away first leaves a message with no connection behind; completing
+ * it must be harmless, and the server must keep answering.
+ */
+GST_START_TEST (test_http_client_gone_before_response)
+{
+  GstdReturnCode ret;
+  gchar *response;
+  guint status_code;
+  int i;
+
+  ret = gstd_ipc_start (GSTD_IPC (test_http), test_session);
+  fail_if (ret != GSTD_EOK);
+
+  g_usleep (100000);
+
+  for (i = 0; i < 200; i++) {
+    static const gchar request[] =
+        "GET /pipelines HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    GSocketClient *client = g_socket_client_new ();
+    GSocketConnection *conn = g_socket_client_connect_to_host (client,
+        TEST_HTTP_ADDRESS, TEST_HTTP_PORT, NULL, NULL);
+
+    fail_if (NULL == conn, "Connection %d failed", i);
+    g_output_stream_write_all (g_io_stream_get_output_stream (G_IO_STREAM
+            (conn)), request, strlen (request), NULL, NULL, NULL);
+    /* Closed without reading: the request is still queued or running */
+    g_io_stream_close (G_IO_STREAM (conn), NULL, NULL);
+    g_object_unref (conn);
+    g_object_unref (client);
+
+    /* A served request in between keeps both kinds interleaved */
+    if (i % 20 == 0) {
+      response = http_get ("/pipelines", &status_code);
+      fail_if (status_code != 200, "Request after %d disconnects failed "
+          "with status %u", i, status_code);
+      g_free (response);
+    }
+  }
+
+  response = http_get ("/pipelines", &status_code);
+  fail_if (status_code != 200, "Final request failed with status %u",
+      status_code);
+  fail_if (NULL == response || NULL == strstr (response, "\"code\" : 0"));
+  g_free (response);
+}
+GST_END_TEST;
+
+/*
  * Test: Server restart after stop
  */
 GST_START_TEST (test_http_server_restart)
@@ -1594,6 +1645,7 @@ gstd_http_suite (void)
   tcase_add_test (tc, test_http_get_pipelines);
   tcase_add_test (tc, test_http_invalid_path);
   tcase_add_test (tc, test_http_concurrent_requests);
+  tcase_add_test (tc, test_http_client_gone_before_response);
   tcase_add_test (tc, test_http_server_restart);
   tcase_add_test (tc, test_http_no_cors_by_default);
   tcase_add_test (tc, test_http_cors_origin_configured);
